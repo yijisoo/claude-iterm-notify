@@ -25,16 +25,35 @@ assert_contains "$(mock_args tmux)" "list-clients" "queried tmux clients"
 assert_contains "$(mock_stdin osascript)" 'tty of s is "/dev/ttys8"' "focuses resolved client tty"
 teardown
 
-# ── Click-to-focus: detached tmux session ──────────────────────────
-test_case "--focus tmux: (detached, exists) attaches in a new tab"
+# ── Click-to-focus: detached session, reuse an existing tmux tab ────
+test_case "--focus tmux: (detached) reuses an existing tmux client, no new tab"
+setup
+# No client for sess1 (detached), but another tmux client exists at ttys8.
+# list-clients with -F '#{client_tty}\t#{session_name}' (resolve step) returns
+# no match for sess1; list-clients with -F '#{client_tty}' (reuse step) lists ttys8.
+mock tmux 'case "$1 ${2:-} ${3:-}" in
+  "list-clients -F #{client_tty}") echo "/dev/ttys8" ;;
+  "list-clients"*) : ;;                      # resolve step: no client for sess1
+  "has-session"*) exit 0 ;;
+  "switch-client"*) exit 0 ;;
+esac'
+mock osascript 'echo yes'
+run_notify bash "$NOTIFY" --focus 'tmux:sess1' </dev/null
+osa="$(mock_stdin osascript)"
+assert_contains "$(mock_args tmux)" "switch-client" "switches an existing client to the session"
+assert_contains "$osa" 'tty of s is "/dev/ttys8"' "focuses the reused client's tab"
+assert_not_contains "$osa" "create tab" "does NOT open a new tab"
+teardown
+
+# ── Click-to-focus: detached, no tmux client to reuse -> new tab ────
+test_case "--focus tmux: (detached, no client) falls back to a new tab"
 setup
 mock tmux 'case "$1" in list-clients) : ;; has-session) exit 0 ;; esac'
 mock osascript 'true'
 run_notify bash "$NOTIFY" --focus 'tmux:sess1' </dev/null
 osa="$(mock_stdin osascript)"
-assert_contains "$osa" "create tab" "opens a new tab"
+assert_contains "$osa" "create tab" "opens a new tab when no client to reuse"
 assert_contains "$osa" "/tmux attach-session -t 'sess1'" "attaches via an absolute tmux path"
-assert_not_contains "$osa" "command \"tmux attach" "does not use a bare (PATH-less) tmux"
 teardown
 
 # ── Click-to-focus: tmux session no longer exists ──────────────────

@@ -136,15 +136,22 @@ if [ "${1:-}" = "--focus" ]; then
       if [ -n "$CLIENT_TTY" ]; then
         log "--focus: tmux '$SESSION' attached at $CLIENT_TTY -> $(focus_iterm_tty "$CLIENT_TTY")"
       else
-        # Detached: attach it in a fresh tab if the session still exists.
+        # Detached: no iTerm tab currently shows this session. OMC sessions
+        # detach/reattach constantly, so rather than spawning a new tab every
+        # time, reuse an existing tmux tab — point one of its clients at this
+        # session (tmux switch-client) and focus that iTerm tab.
         if tmux has-session -t "$SESSION" 2>/dev/null; then
-          log "--focus: tmux '$SESSION' detached -> attaching in new tab"
-          # iTerm2 runs the tab command via execvp with NO shell and NO PATH
-          # search, so tmux must be an absolute path or it fails with
-          # "execvp failed / No such file or directory". The session is wrapped
-          # in single quotes for iTerm2's own quote-aware tokenizer (not a shell).
-          TMUX_BIN=$(command -v tmux 2>/dev/null || echo tmux)
-          open_iterm_tab "$TMUX_BIN attach-session -t '$SESSION'"
+          REUSE_TTY=$(tmux list-clients -F '#{client_tty}' 2>/dev/null | head -n1 || true)
+          if [ -n "$REUSE_TTY" ] && tmux switch-client -c "$REUSE_TTY" -t "$SESSION" 2>/dev/null; then
+            log "--focus: tmux '$SESSION' detached -> switched client $REUSE_TTY -> $(focus_iterm_tty "$REUSE_TTY")"
+          else
+            # No existing tmux client to reuse -> attach in a new tab.
+            # iTerm2 runs the tab command via execvp with NO shell and NO PATH
+            # search, so tmux must be an absolute path.
+            log "--focus: tmux '$SESSION' detached, no client to reuse -> new tab"
+            TMUX_BIN=$(command -v tmux 2>/dev/null || echo tmux)
+            open_iterm_tab "$TMUX_BIN attach-session -t '$SESSION'"
+          fi
         else
           log "--focus: tmux '$SESSION' no longer exists"
           osa -e 'tell application "iTerm2" to activate' 2>/dev/null || true
