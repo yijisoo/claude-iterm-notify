@@ -277,6 +277,40 @@ NOTIFY_ALWAYS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_acti
 assert_eq 1 "$(mock_calls terminal-notifier)" "override forces a notification"
 teardown
 
+# ── Watching suppression on the tmux path (most common OMC topology) ─
+test_case "stop on a watched tmux session is suppressed"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+# Pane ttys9 belongs to session sW, attached at client ttys8.
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tsW\twork\n" ;;
+  list-clients) printf "/dev/ttys8\tsW\n" ;;
+esac'
+# iTerm2 frontmost AND its current tab is the client tty ttys8 -> watching.
+mock osascript 'case "$* $__stdin" in
+  *"is running"*) echo true ;;
+  *frontmost*) echo iTerm2 ;;
+  *"current session of current window"*) echo /dev/ttys8 ;;
+  *) echo "" ;;
+esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_eq 0 "$(mock_calls terminal-notifier)" "watched tmux session is suppressed"
+teardown
+
+# ── A huge/non-string message is clamped, not dumped raw ───────────
+test_case "oversized permission message is clamped to 200 chars"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+big=$(printf 'x%.0s' $(seq 1 500))
+run_notify bash "$NOTIFY" permission <<<"{\"cwd\":\"/x/p\",\"message\":\"$big\"}"
+# The -message arg must not contain the full 500-char blob.
+longest=$(mock_args terminal-notifier | tr ' ' '\n' | awk '{ if (length > m) m = length } END { print m }')
+if [ "$longest" -le 220 ]; then pass "message clamped (longest token ${longest}b)"; else fail "message not clamped (${longest}b)"; fi
+teardown
+
 # ── Don't launch iTerm2 when it isn't running ──────────────────────
 test_case "direct path skips the iTerm2 query when iTerm2 isn't running"
 setup

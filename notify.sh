@@ -287,14 +287,16 @@ case "$HOOK_TYPE" in
     TITLE="$PROJECT — Permission"
     MSG=$(/usr/bin/python3 -c "
 import sys, json
-print(json.load(sys.stdin).get('message', 'Permission needed'))
+m = json.load(sys.stdin).get('message', 'Permission needed')
+print(str(m)[:200])
 " <<< "$PAYLOAD" 2>/dev/null || echo "Permission needed")
     ;;
   question)
     TITLE="$PROJECT — Question"
     MSG=$(/usr/bin/python3 -c "
 import sys, json
-print(json.load(sys.stdin).get('message', 'Claude has a question'))
+m = json.load(sys.stdin).get('message', 'Claude has a question')
+print(str(m)[:200])
 " <<< "$PAYLOAD" 2>/dev/null || echo "Claude has a question")
     ;;
   *)
