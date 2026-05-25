@@ -59,7 +59,7 @@ test_case "stop in a tmux pane builds a tmux: target with pane-title subtitle"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 mock tmux 'case "$1" in
-  list-panes) echo "/dev/ttys9 omc-proj-main-001 the task title" ;;
+  list-panes) echo "/dev/ttys9|omc-proj-main-001|the task title" ;;
   list-clients) echo "/dev/ttys8|omc-proj-main-001" ;;
 esac'
 mock osascript 'echo Finder'   # frontmost != iTerm2 -> not watching
@@ -90,7 +90,7 @@ test_case "second stop within the window is debounced"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 mock tmux 'case "$1" in
-  list-panes) echo "/dev/ttys9 sessX one" ;;
+  list-panes) echo "/dev/ttys9|sessX|one" ;;
   list-clients) echo "/dev/ttys8|sessX" ;;
 esac'
 mock osascript 'echo Finder'
@@ -105,7 +105,7 @@ test_case "two rapid permission prompts both notify"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 mock tmux 'case "$1" in
-  list-panes) echo "/dev/ttys9 sessY one" ;;
+  list-panes) echo "/dev/ttys9|sessY|one" ;;
   list-clients) echo "/dev/ttys8|sessY" ;;
 esac'
 mock osascript 'echo Finder'
@@ -128,6 +128,92 @@ esac'
 mock terminal-notifier 'true'
 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 assert_eq 0 "$(mock_calls terminal-notifier)" "watched session is not notified"
+# Positive check: confirm we actually reached the watching logic (not an
+# earlier bail-out), so this can't pass for the wrong reason.
+assert_contains "$(mock_args osascript)" "frontmost" "frontmost was queried"
+teardown
+
+# ── get_tty walks multiple ppid levels before finding a tty ────────
+test_case "get_tty skips ?? ttys and walks up to the first real tty"
+setup
+# First tty query returns "??" (no tty); the next level up returns a real tty.
+# notify.sh's own $$ is unknowable here, so toggle on a marker file instead.
+mock ps 'case "$*" in
+  *"-o tty="*) if [ -f "'"$SANDBOX"'/seen" ]; then echo ttys9; else touch "'"$SANDBOX"'/seen"; echo "??"; fi ;;
+  *"-o ppid="*) echo 2 ;;
+esac'
+mock tmux 'case "$1" in
+  list-panes) echo "/dev/ttys9|sx|t" ;;
+  list-clients) echo "/dev/ttys8|sx" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/walk","stop_hook_active":false}'
+assert_contains "$(mock_args terminal-notifier)" "--focus 'tmux:sx'" "found tty after walking up one level"
+teardown
+
+# ── No tty found anywhere -> -activate fallback ────────────────────
+test_case "no controlling tty falls back to -activate iTerm2"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo "??" ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+tn="$(mock_args terminal-notifier)"
+assert_contains "$tn" "-activate com.googlecode.iterm2" "uses activate fallback"
+assert_not_contains "$tn" "--focus" "no click callback without a target"
+teardown
+
+# ── Debounce window expiry: second stop after the window notifies ──
+test_case "stop after the debounce window notifies again"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in list-panes) echo "/dev/ttys9|sz|t" ;; list-clients) echo "/dev/ttys8|sz" ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+NOTIFY_DEBOUNCE_SECONDS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+sleep 2
+NOTIFY_DEBOUNCE_SECONDS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_eq 2 "$(mock_calls terminal-notifier)" "both stops notify once window elapses"
+teardown
+
+# ── tmux session name with spaces survives parsing ─────────────────
+test_case "session name with spaces is parsed correctly"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) echo "/dev/ttys9|my session|some title here" ;;
+  list-clients) echo "/dev/ttys8|my session" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+tn="$(mock_args terminal-notifier)"
+assert_contains "$tn" "--focus 'tmux:my session'" "session name with spaces preserved"
+assert_contains "$tn" "some title here" "pane title with spaces preserved"
+teardown
+
+# ── question hook extracts the message ─────────────────────────────
+test_case "question hook builds Question title with the message"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'echo Finder'   # direct path, not watching
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" question <<<'{"cwd":"/x/proj","message":"which option?"}'
+tn="$(mock_args terminal-notifier)"
+assert_contains "$tn" "proj — Question" "title marks a question"
+assert_contains "$tn" "which option?" "message is the question text"
+teardown
+
+# ── Empty/malformed payload degrades to 'unknown', no crash ────────
+test_case "empty payload yields the 'unknown' project, still notifies"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop </dev/null
+tn="$(mock_args terminal-notifier)"
+assert_contains "$tn" "unknown" "falls back to 'unknown' project"
 teardown
 
 # ── NOTIFY_ALWAYS overrides the watching suppression ───────────────

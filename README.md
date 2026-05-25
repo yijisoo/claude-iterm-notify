@@ -99,6 +99,7 @@ The hook script lives at `~/.claude/hooks/notify.sh`. Behavior is tunable via en
 |----------|---------|--------|
 | `NOTIFY_ALWAYS=1` | unset | Notify even for a session you're actively watching |
 | `NOTIFY_DEBOUNCE_SECONDS` | `180` | Min seconds between "stop" notifications for the same session (loop dedup) |
+| `NOTIFY_DEBOUNCE_DIR` | `/tmp/claude-iterm-notify-debounce` | Where per-session debounce stamps are kept |
 | `NOTIFY_DEBUG=1` | unset | Write a decision trace to `/tmp/claude-iterm-notification-*.log` |
 
 Other tweaks:
@@ -114,6 +115,8 @@ A dependency-free test suite (pure bash, no `bats`) lives in `tests/`. It runs `
 ./tests/run.sh                 # run everything
 ./tests/run.sh test_notify.sh  # run one suite
 ```
+
+(The harness sets `NOTIFY_TEST=1` so `notify.sh` skips its Homebrew PATH prepend and the mock tools on `PATH` take effect.)
 
 Covers: click-to-focus routing (direct tty / attached tmux / detached tmux / missing session), session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, stop debouncing, and the install/uninstall settings.json merge & removal logic.
 
