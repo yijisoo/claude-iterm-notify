@@ -73,6 +73,6 @@ echo "Done! Notifications removed."
 echo ""
 read -p "Also uninstall terminal-notifier? [y/N] " -n 1 -r || true
 echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
+if [[ "${REPLY:-}" =~ ^[Yy]$ ]]; then
   brew uninstall terminal-notifier 2>/dev/null && echo "[ok] terminal-notifier uninstalled" || echo "[--] terminal-notifier not installed via brew"
 fi

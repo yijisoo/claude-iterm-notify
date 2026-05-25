@@ -35,6 +35,12 @@ else
   log() { :; }
 fi
 
+# ── Escaping helpers ───────────────────────────────────────────────
+# Escape a string for embedding in an AppleScript double-quoted literal.
+as_escape() { local s=${1//\\/\\\\}; printf '%s' "${s//\"/\\\"}"; }
+# Escape a string for embedding inside single quotes in a shell command.
+sq_escape() { printf '%s' "${1//\'/\'\\\'\'}"; }
+
 # ── AppleScript: select the iTerm2 tab whose session has the given tty ──
 # Returns "yes" on success, "no" if no matching tty is currently visible.
 focus_iterm_tty() {
@@ -68,7 +74,8 @@ EOF
 
 # ── AppleScript: open a new iTerm2 tab running a command ────────────
 open_iterm_tab() {
-  local cmd="$1"
+  local cmd
+  cmd=$(as_escape "$1")
   osascript 2>/dev/null <<EOF || true
 tell application "iTerm2"
   activate
@@ -103,7 +110,7 @@ if [ "${1:-}" = "--focus" ]; then
         # Detached: attach it in a fresh tab if the session still exists.
         if tmux has-session -t "$SESSION" 2>/dev/null; then
           log "--focus: tmux '$SESSION' detached -> attaching in new tab"
-          open_iterm_tab "tmux attach-session -t '$SESSION'"
+          open_iterm_tab "tmux attach-session -t '$(sq_escape "$SESSION")'"
         else
           log "--focus: tmux '$SESSION' no longer exists"
           osascript -e 'tell application "iTerm2" to activate' 2>/dev/null || true
@@ -145,7 +152,9 @@ DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-180}"
 DEBOUNCE_DIR="${NOTIFY_DEBOUNCE_DIR:-/tmp/claude-iterm-notify-debounce}"
 debounce_ok() {
   local target="$1" key stamp now mtime
-  key=$(printf '%s' "$target" | tr -c 'a-zA-Z0-9' '_')
+  # Hash the target so distinct sessions never collide on a sanitized key.
+  key=$(printf '%s' "$target" | shasum 2>/dev/null | cut -c1-40)
+  [ -z "$key" ] && key=$(printf '%s' "$target" | tr -c 'a-zA-Z0-9' '_')
   mkdir -p "$DEBOUNCE_DIR"
   stamp="$DEBOUNCE_DIR/$key"
   now=$(date +%s)
@@ -185,12 +194,13 @@ identify_target() {
   # Is this tty a tmux pane? If so the durable handle is the session name,
   # and the human-friendly subtitle is the pane title (the Claude activity).
   if command -v tmux >/dev/null 2>&1; then
+    # Use a '|' delimiter so session names / pane titles with spaces survive.
     local line session title
-    line=$(tmux list-panes -a -F '#{pane_tty} #{session_name} #{pane_title}' 2>/dev/null \
-      | awk -v t="$raw_tty" '$1 == t {print; exit}')
+    line=$(tmux list-panes -a -F '#{pane_tty}|#{session_name}|#{pane_title}' 2>/dev/null \
+      | awk -F'|' -v t="$raw_tty" '$1 == t {print; exit}')
     if [ -n "$line" ]; then
-      session=$(echo "$line" | awk '{print $2}')
-      title=$(echo "$line" | cut -d' ' -f3-)
+      session=$(printf '%s' "$line" | cut -d'|' -f2)
+      title=$(printf '%s' "$line" | cut -d'|' -f3-)
       printf 'tmux:%s\n%s\n' "$session" "${title:-$session}"
       return
     fi
@@ -289,7 +299,7 @@ ARGS=(-title "$TITLE" -message "$MSG" -sound default)
 
 if [ -n "$TARGET" ]; then
   ARGS+=(-group "claude-${TARGET}")
-  ARGS+=(-execute "$HOME/.claude/hooks/notify.sh --focus '$TARGET'")
+  ARGS+=(-execute "$HOME/.claude/hooks/notify.sh --focus '$(sq_escape "$TARGET")'")
 else
   ARGS+=(-activate com.googlecode.iterm2)
 fi
