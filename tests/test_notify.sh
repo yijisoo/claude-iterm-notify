@@ -277,4 +277,14 @@ NOTIFY_ALWAYS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_acti
 assert_eq 1 "$(mock_calls terminal-notifier)" "override forces a notification"
 teardown
 
+# ── terminal-notifier chatter must not leak to stdout ──────────────
+test_case "terminal-notifier output is not surfaced as hook output"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'echo Finder'   # direct path, not watching
+mock terminal-notifier 'echo "* Removing previously sent notification, which was sent on: now"'
+out=$(run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}')
+assert_eq "" "$out" "no stray stdout/stderr from terminal-notifier"
+teardown
+
 finish

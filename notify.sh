@@ -306,5 +306,8 @@ else
 fi
 
 log "terminal-notifier: title=$TITLE target=$TARGET"
-terminal-notifier "${ARGS[@]}"
+# Silence terminal-notifier's "* Removing previously sent notification…"
+# chatter on stdout (it replaces grouped notifications on every fire), which
+# Claude Code would otherwise surface as spurious hook output.
+terminal-notifier "${ARGS[@]}" >/dev/null 2>&1 || true
 log "done"
