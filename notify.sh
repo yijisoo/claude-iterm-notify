@@ -132,7 +132,7 @@ if [ "${1:-}" = "--focus" ]; then
       SESSION="${TARGET#tmux:}"
       # Resolve the *currently* attached client (iTerm2 tty), if any.
       CLIENT_TTY=$(tmux list-clients -F $'#{client_tty}\t#{session_name}' 2>/dev/null \
-        | awk -F'\t' -v s="$SESSION" '$2 == s {print $1; exit}')
+        | awk -F'\t' -v s="$SESSION" '$2 == s {print $1; exit}' || true)
       if [ -n "$CLIENT_TTY" ]; then
         log "--focus: tmux '$SESSION' attached at $CLIENT_TTY -> $(focus_iterm_tty "$CLIENT_TTY")"
       else
@@ -200,15 +200,14 @@ debounce_ok() {
 
 # ── Find the controlling tty by walking up the process tree ───────
 get_tty() {
-  local pid=$$
-  while [ "$pid" -gt 1 ]; do
-    local t
-    t=$(ps -p "$pid" -o tty= 2>/dev/null | tr -d ' ')
+  local pid=$$ t
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+    t=$(ps -p "$pid" -o tty= 2>/dev/null | tr -d ' ' || true)
     if [ -n "$t" ] && [ "$t" != "??" ]; then
       echo "/dev/$t"
       return
     fi
-    pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+    pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
   done
 }
 
@@ -230,7 +229,7 @@ identify_target() {
     # but not tabs, so this survives any legal name.
     local line session title
     line=$(tmux list-panes -a -F $'#{pane_tty}\t#{session_name}\t#{pane_title}' 2>/dev/null \
-      | awk -F'\t' -v t="$raw_tty" '$1 == t {print; exit}')
+      | awk -F'\t' -v t="$raw_tty" '$1 == t {print; exit}' || true)
     if [ -n "$line" ]; then
       session=$(printf '%s' "$line" | cut -d$'\t' -f2)
       title=$(printf '%s' "$line" | cut -d$'\t' -f3-)
@@ -314,7 +313,7 @@ case "$TARGET" in
   tmux:*)
     SESSION="${TARGET#tmux:}"
     ITERM_TTY=$(tmux list-clients -F $'#{client_tty}\t#{session_name}' 2>/dev/null \
-      | awk -F'\t' -v s="$SESSION" '$2 == s {print $1; exit}')
+      | awk -F'\t' -v s="$SESSION" '$2 == s {print $1; exit}' || true)
     ;;
   *) ITERM_TTY="" ;;
 esac

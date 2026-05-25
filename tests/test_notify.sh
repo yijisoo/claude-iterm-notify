@@ -331,6 +331,32 @@ assert_not_contains "$tn" "LAUNCHED_ITERM" "iTerm2 session query was NOT issued"
 assert_contains "$tn" "--focus 'tty:/dev/ttys9'" "still targets the tty"
 teardown
 
+# ── tmux server failure must not abort the hook (set -e + pipefail) ─
+test_case "stop does not abort when tmux commands fail (no server)"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+# tmux exists but every subcommand fails (server down) -> exit 1, no output.
+mock tmux 'exit 1'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+if run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'; then
+  pass "hook exits 0 despite tmux failures"
+else
+  fail "hook aborted (rc=$?) on tmux failure"
+fi
+teardown
+
+test_case "--focus tmux: does not abort when tmux server is down"
+setup
+mock tmux 'exit 1'
+mock osascript 'true'
+if run_notify bash "$NOTIFY" --focus 'tmux:gone' </dev/null; then
+  pass "--focus exits 0 despite tmux failure"
+else
+  fail "--focus aborted (rc=$?) on tmux failure"
+fi
+teardown
+
 # ── terminal-notifier chatter must not leak to stdout ──────────────
 test_case "terminal-notifier output is not surfaced as hook output"
 setup
