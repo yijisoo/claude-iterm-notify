@@ -48,6 +48,22 @@ osa() {
   fi
 }
 
+# ── Is iTerm2 already running? (does NOT launch it) ────────────────
+# `application "X" is running` is the canonical non-launching probe; a bare
+# `tell application "iTerm2"` would otherwise boot iTerm2 in the background
+# for users on Terminal.app/VS Code/etc. Cached for the life of the process.
+ITERM_RUNNING_CACHE=""
+iterm_running() {
+  if [ -z "$ITERM_RUNNING_CACHE" ]; then
+    if [ "$(osa -e 'application "iTerm2" is running' 2>/dev/null)" = "true" ]; then
+      ITERM_RUNNING_CACHE=yes
+    else
+      ITERM_RUNNING_CACHE=no
+    fi
+  fi
+  [ "$ITERM_RUNNING_CACHE" = "yes" ]
+}
+
 # ── Escaping helpers ───────────────────────────────────────────────
 # Escape a string for embedding in an AppleScript double-quoted literal.
 as_escape() { local s=${1//\\/\\\\}; printf '%s' "${s//\"/\\\"}"; }
@@ -224,8 +240,10 @@ identify_target() {
   fi
 
   # Direct iTerm2 session. Subtitle = the iTerm2 tab/session name.
-  local name
-  name=$(osascript 2>/dev/null <<EOF || true
+  # Skip the query (and avoid launching iTerm2) if it isn't already running.
+  local name=""
+  if iterm_running; then
+    name=$(osa 2>/dev/null <<EOF || true
 tell application "iTerm2"
   repeat with w in windows
     try
@@ -245,6 +263,7 @@ tell application "iTerm2"
 end tell
 EOF
 )
+  fi
   printf 'tty:%s\n%s\n' "$raw_tty" "$name"
 }
 

@@ -77,7 +77,7 @@ test_case "stop in a direct iTerm2 tab builds a tty: target"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 # No tmux mock -> command -v tmux fails -> direct path.
-mock osascript 'case "$* $__stdin" in *frontmost*) echo Finder ;; *) echo myterm ;; esac'
+mock osascript 'case "$* $__stdin" in *"is running"*) echo true ;; *frontmost*) echo Finder ;; *) echo myterm ;; esac'
 mock terminal-notifier 'true'
 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/proj2","stop_hook_active":false}'
 tn="$(mock_args terminal-notifier)"
@@ -275,6 +275,26 @@ esac'
 mock terminal-notifier 'true'
 NOTIFY_ALWAYS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 assert_eq 1 "$(mock_calls terminal-notifier)" "override forces a notification"
+teardown
+
+# ── Don't launch iTerm2 when it isn't running ──────────────────────
+test_case "direct path skips the iTerm2 query when iTerm2 isn't running"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+# is running -> false; if the name lookup were attempted it would echo a
+# sentinel. The guard must prevent that osascript from ever running.
+mock osascript 'case "$* $__stdin" in
+  *"is running"*) echo false ;;
+  *frontmost*) echo Finder ;;
+  *"name of s"*) echo LAUNCHED_ITERM ;;
+  *) echo "" ;;
+esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+tn="$(mock_args terminal-notifier)"
+assert_eq 1 "$(mock_calls terminal-notifier)" "still notifies (no subtitle)"
+assert_not_contains "$tn" "LAUNCHED_ITERM" "iTerm2 session query was NOT issued"
+assert_contains "$tn" "--focus 'tty:/dev/ttys9'" "still targets the tty"
 teardown
 
 # ── terminal-notifier chatter must not leak to stdout ──────────────
