@@ -48,7 +48,7 @@ tell application "iTerm2"
       repeat with s in sessions of t
         set sid to unique id of s
         if sid is in "$iterm_id" or "$iterm_id" is in sid then
-          return name of t
+          return name of s
         end if
       end repeat
     end repeat
