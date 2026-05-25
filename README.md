@@ -20,7 +20,8 @@ Native macOS notifications when [Claude Code](https://docs.anthropic.com/en/docs
 - [iTerm2](https://iterm2.com)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 - [Homebrew](https://brew.sh) (for installing terminal-notifier)
-- `tmux` (only if you run Claude inside tmux / OMC — used to map the session back to its tab)
+
+> Optional: if you happen to run Claude inside **tmux** (e.g. via OMC), the script uses `tmux` to map the session back to its tab. It's not required for plain iTerm2 usage.
 
 ## Install
 
