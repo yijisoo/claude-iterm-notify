@@ -22,7 +22,10 @@ set -euo pipefail
 
 # terminal-notifier's click callback runs with a minimal PATH that excludes
 # Homebrew, so tmux/terminal-notifier would not be found. Ensure they are.
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Skipped under NOTIFY_TEST so the test harness can shadow tools with mocks.
+if [ -z "${NOTIFY_TEST:-}" ]; then
+  export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+fi
 
 # Set NOTIFY_DEBUG=1 to trace decisions to /tmp/claude-iterm-notification-*.log
 if [ "${NOTIFY_DEBUG:-}" = "1" ]; then
@@ -138,13 +141,13 @@ EOF
 # ── Debounce: true (notify) if this target wasn't notified recently ──
 # OMC loop modes (ralph/autopilot) make Claude stop-and-continue rapidly;
 # without this every iteration would ping. One notification per window.
-DEBOUNCE_SECONDS=180
+DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-180}"
+DEBOUNCE_DIR="${NOTIFY_DEBOUNCE_DIR:-/tmp/claude-iterm-notify-debounce}"
 debounce_ok() {
-  local target="$1" key dir stamp now mtime
+  local target="$1" key stamp now mtime
   key=$(printf '%s' "$target" | tr -c 'a-zA-Z0-9' '_')
-  dir="/tmp/claude-iterm-notify-debounce"
-  mkdir -p "$dir"
-  stamp="$dir/$key"
+  mkdir -p "$DEBOUNCE_DIR"
+  stamp="$DEBOUNCE_DIR/$key"
   now=$(date +%s)
   if [ -f "$stamp" ]; then
     mtime=$(stat -f %m "$stamp" 2>/dev/null || echo 0)
