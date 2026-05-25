@@ -33,7 +33,8 @@ mock osascript 'true'
 run_notify bash "$NOTIFY" --focus 'tmux:sess1' </dev/null
 osa="$(mock_stdin osascript)"
 assert_contains "$osa" "create tab" "opens a new tab"
-assert_contains "$osa" "tmux attach-session -t 'sess1'" "attaches the detached session"
+assert_contains "$osa" "/tmux attach-session -t 'sess1'" "attaches via an absolute tmux path"
+assert_not_contains "$osa" "command \"tmux attach" "does not use a bare (PATH-less) tmux"
 teardown
 
 # ── Click-to-focus: tmux session no longer exists ──────────────────

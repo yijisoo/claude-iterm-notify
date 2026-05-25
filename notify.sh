@@ -139,7 +139,12 @@ if [ "${1:-}" = "--focus" ]; then
         # Detached: attach it in a fresh tab if the session still exists.
         if tmux has-session -t "$SESSION" 2>/dev/null; then
           log "--focus: tmux '$SESSION' detached -> attaching in new tab"
-          open_iterm_tab "tmux attach-session -t '$(sq_escape "$SESSION")'"
+          # iTerm2 runs the tab command via execvp with NO shell and NO PATH
+          # search, so tmux must be an absolute path or it fails with
+          # "execvp failed / No such file or directory". The session is wrapped
+          # in single quotes for iTerm2's own quote-aware tokenizer (not a shell).
+          TMUX_BIN=$(command -v tmux 2>/dev/null || echo tmux)
+          open_iterm_tab "$TMUX_BIN attach-session -t '$SESSION'"
         else
           log "--focus: tmux '$SESSION' no longer exists"
           osa -e 'tell application "iTerm2" to activate' 2>/dev/null || true
