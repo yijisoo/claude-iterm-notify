@@ -26,7 +26,10 @@ tell application "iTerm2"
         set sid to unique id of s
         -- Match regardless of whether unique id includes wXtYpZ: prefix
         if sid is in targetId or targetId is in sid then
-          select s
+          try
+            select w
+          end try
+          select t
           return
         end if
       end repeat
