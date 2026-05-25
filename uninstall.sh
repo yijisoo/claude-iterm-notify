@@ -40,7 +40,7 @@ for event in list(settings["hooks"].keys()):
     filtered = [
         entry for entry in original
         if not any(
-            "notify.sh" in h.get("command", "")
+            ".claude/hooks/notify.sh" in h.get("command", "")
             for h in entry.get("hooks", [])
             if h.get("type") == "command"
         )
@@ -71,7 +71,7 @@ fi
 echo ""
 echo "Done! Notifications removed."
 echo ""
-read -p "Also uninstall terminal-notifier? [y/N] " -n 1 -r
+read -p "Also uninstall terminal-notifier? [y/N] " -n 1 -r || true
 echo ""
 if [[ $REPLY =~ ^[Yy]$ ]]; then
   brew uninstall terminal-notifier 2>/dev/null && echo "[ok] terminal-notifier uninstalled" || echo "[--] terminal-notifier not installed via brew"
