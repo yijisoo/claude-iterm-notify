@@ -16,27 +16,52 @@ if [ "${1:-}" = "--focus" ]; then
   TARGET_ID="${2:-}"
   [ -z "$TARGET_ID" ] && exit 0
 
-  osascript <<EOF
+  # Try UUID search first; fall back to wXtYpZ index if UUID is stale
+  FOUND=$(osascript 2>/dev/null <<EOF || echo "no"
 tell application "iTerm2"
   activate
   set targetId to "$TARGET_ID"
   repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        set sid to unique id of s
-        -- Match regardless of whether unique id includes wXtYpZ: prefix
-        if sid is in targetId or targetId is in sid then
-          try
-            select w
-          end try
-          select t
-          return
-        end if
+    try
+      repeat with t in tabs of w
+        try
+          repeat with s in sessions of t
+            try
+              set sid to unique id of s
+              if sid is in targetId or targetId is in sid then
+                try
+                  select w
+                end try
+                select t
+                return "yes"
+              end if
+            end try
+          end repeat
+        end try
       end repeat
-    end repeat
+    end try
   end repeat
+  return "no"
 end tell
 EOF
+)
+
+  # Fallback: use window/tab indices from the wXtYpZ: prefix
+  if [ "$FOUND" != "yes" ] && [[ "$TARGET_ID" =~ ^w([0-9]+)t([0-9]+)p ]]; then
+    W_IDX=$(( ${BASH_REMATCH[1]} + 1 ))
+    T_IDX=$(( ${BASH_REMATCH[2]} + 1 ))
+    osascript 2>/dev/null <<EOF || true
+tell application "iTerm2"
+  activate
+  try
+    set targetWindow to window $W_IDX
+    select targetWindow
+    select tab $T_IDX of targetWindow
+  end try
+end tell
+EOF
+  fi
+
   exit 0
 fi
 
