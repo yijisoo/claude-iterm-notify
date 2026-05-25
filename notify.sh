@@ -1,86 +1,237 @@
 #!/bin/bash
-# macOS notifications for Claude Code with iTerm2 click-to-focus
+# macOS notifications for Claude Code / OMC with iTerm2 click-to-focus.
 #
-# Usage (called by Claude Code hooks):
+# Works for three session topologies:
+#   1. claude running directly in an iTerm2 tab        -> focus that tab
+#   2. claude running in a tmux session shown in a tab -> focus that tab
+#   3. claude in a *detached* tmux session (OMC bg)    -> attach in a new tab
+#
+# The durable handle is the tmux session name (survives detach/reattach);
+# the iTerm2 tab is only a *current* view of it, resolved at click time.
+#
+# Usage (Claude Code hooks):
 #   echo '{"cwd":"/path"}' | notify.sh stop
 #   echo '{"message":"..."}' | notify.sh permission
 #   echo '{"message":"..."}' | notify.sh question
 #
-# Click callback (called by terminal-notifier):
-#   notify.sh --focus <ITERM_SESSION_ID>
+# Click callback (terminal-notifier):
+#   notify.sh --focus 'tty:/dev/ttysNNN'
+#   notify.sh --focus 'tmux:<session-name>'
 
 set -euo pipefail
 
-# ── Click-to-focus callback ────────────────────────────────────────
-if [ "${1:-}" = "--focus" ]; then
-  TARGET_ID="${2:-}"
-  [ -z "$TARGET_ID" ] && exit 0
+# terminal-notifier's click callback runs with a minimal PATH that excludes
+# Homebrew, so tmux/terminal-notifier would not be found. Ensure they are.
+# Skipped under NOTIFY_TEST so the test harness can shadow tools with mocks.
+if [ -z "${NOTIFY_TEST:-}" ]; then
+  export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+fi
 
-  osascript <<EOF
+# Set NOTIFY_DEBUG=1 to trace decisions to /tmp/claude-iterm-notification-*.log
+if [ "${NOTIFY_DEBUG:-}" = "1" ]; then
+  LOG="/tmp/claude-iterm-notification-$(date +%Y%m%d-%H%M%S)-$$.log"
+  log() { echo "$(date +%T) $*" >> "$LOG"; }
+else
+  log() { :; }
+fi
+
+# ── AppleScript: select the iTerm2 tab whose session has the given tty ──
+# Returns "yes" on success, "no" if no matching tty is currently visible.
+focus_iterm_tty() {
+  local target_tty="$1"
+  osascript 2>/dev/null <<EOF || echo "no"
 tell application "iTerm2"
   activate
-  set targetId to "$TARGET_ID"
   repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        set sid to unique id of s
-        -- Match regardless of whether unique id includes wXtYpZ: prefix
-        if sid is in targetId or targetId is in sid then
-          try
-            select w
-          end try
-          select t
-          return
-        end if
+    try
+      repeat with t in tabs of w
+        try
+          repeat with s in sessions of t
+            try
+              if tty of s is "$target_tty" then
+                try
+                  select w
+                end try
+                select t
+                return "yes"
+              end if
+            end try
+          end repeat
+        end try
       end repeat
-    end repeat
+    end try
   end repeat
+  return "no"
 end tell
 EOF
+}
+
+# ── AppleScript: open a new iTerm2 tab running a command ────────────
+open_iterm_tab() {
+  local cmd="$1"
+  osascript 2>/dev/null <<EOF || true
+tell application "iTerm2"
+  activate
+  if (count of windows) > 0 then
+    tell current window to create tab with default profile command "$cmd"
+  else
+    create window with default profile command "$cmd"
+  end if
+end tell
+EOF
+}
+
+# ── Click-to-focus callback ────────────────────────────────────────
+if [ "${1:-}" = "--focus" ]; then
+  TARGET="${2:-}"
+  [ -z "$TARGET" ] && exit 0
+  log "--focus: target=$TARGET"
+
+  case "$TARGET" in
+    tty:*)
+      TTY_PATH="${TARGET#tty:}"
+      log "--focus: direct tty $TTY_PATH -> $(focus_iterm_tty "$TTY_PATH")"
+      ;;
+    tmux:*)
+      SESSION="${TARGET#tmux:}"
+      # Resolve the *currently* attached client (iTerm2 tty), if any.
+      CLIENT_TTY=$(tmux list-clients -F '#{client_tty}|#{session_name}' 2>/dev/null \
+        | awk -F'|' -v s="$SESSION" '$2 == s {print $1; exit}')
+      if [ -n "$CLIENT_TTY" ]; then
+        log "--focus: tmux '$SESSION' attached at $CLIENT_TTY -> $(focus_iterm_tty "$CLIENT_TTY")"
+      else
+        # Detached: attach it in a fresh tab if the session still exists.
+        if tmux has-session -t "$SESSION" 2>/dev/null; then
+          log "--focus: tmux '$SESSION' detached -> attaching in new tab"
+          open_iterm_tab "tmux attach-session -t '$SESSION'"
+        else
+          log "--focus: tmux '$SESSION' no longer exists"
+          osascript -e 'tell application "iTerm2" to activate' 2>/dev/null || true
+        fi
+      fi
+      ;;
+    *)
+      log "--focus: unknown target scheme"
+      ;;
+  esac
   exit 0
 fi
 
-# ── Helper: get iTerm tab title via AppleScript ───────────────────
-get_tab_title() {
-  local iterm_id="$1"
-  [ -z "$iterm_id" ] && return
-  osascript 2>/dev/null <<EOF || true
+# ── Is the user actively looking at this session right now? ───────
+# True only if iTerm2 is frontmost AND its current tab is the one showing
+# the given iTerm2 tty. Used to suppress redundant notifications.
+user_is_watching() {
+  local iterm_tty="$1"
+  [ -z "$iterm_tty" ] && return 1
+  local front
+  front=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || echo "")
+  [ "$front" != "iTerm2" ] && return 1
+  local cur
+  cur=$(osascript 2>/dev/null <<EOF || true
+tell application "iTerm2"
+  try
+    return tty of current session of current window
+  end try
+end tell
+EOF
+)
+  [ "$cur" = "$iterm_tty" ]
+}
+
+# ── Debounce: true (notify) if this target wasn't notified recently ──
+# OMC loop modes (ralph/autopilot) make Claude stop-and-continue rapidly;
+# without this every iteration would ping. One notification per window.
+DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-180}"
+DEBOUNCE_DIR="${NOTIFY_DEBOUNCE_DIR:-/tmp/claude-iterm-notify-debounce}"
+debounce_ok() {
+  local target="$1" key stamp now mtime
+  key=$(printf '%s' "$target" | tr -c 'a-zA-Z0-9' '_')
+  mkdir -p "$DEBOUNCE_DIR"
+  stamp="$DEBOUNCE_DIR/$key"
+  now=$(date +%s)
+  if [ -f "$stamp" ]; then
+    mtime=$(stat -f %m "$stamp" 2>/dev/null || echo 0)
+    [ $((now - mtime)) -lt "$DEBOUNCE_SECONDS" ] && return 1
+  fi
+  touch "$stamp"
+  return 0
+}
+
+# ── Find the controlling tty by walking up the process tree ───────
+get_tty() {
+  local pid=$$
+  while [ "$pid" -gt 1 ]; do
+    local t
+    t=$(ps -p "$pid" -o tty= 2>/dev/null | tr -d ' ')
+    if [ -n "$t" ] && [ "$t" != "??" ]; then
+      echo "/dev/$t"
+      return
+    fi
+    pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  done
+}
+
+# ── Identify the session. Echoes two lines: TARGET then SUBTITLE. ──
+# TARGET is "tmux:<name>" or "tty:<path>" (empty if no tty found).
+identify_target() {
+  local raw_tty
+  raw_tty=$(get_tty)
+  log "raw_tty=$raw_tty"
+  if [ -z "$raw_tty" ]; then
+    printf '\n\n'
+    return
+  fi
+
+  # Is this tty a tmux pane? If so the durable handle is the session name,
+  # and the human-friendly subtitle is the pane title (the Claude activity).
+  if command -v tmux >/dev/null 2>&1; then
+    local line session title
+    line=$(tmux list-panes -a -F '#{pane_tty} #{session_name} #{pane_title}' 2>/dev/null \
+      | awk -v t="$raw_tty" '$1 == t {print; exit}')
+    if [ -n "$line" ]; then
+      session=$(echo "$line" | awk '{print $2}')
+      title=$(echo "$line" | cut -d' ' -f3-)
+      printf 'tmux:%s\n%s\n' "$session" "${title:-$session}"
+      return
+    fi
+  fi
+
+  # Direct iTerm2 session. Subtitle = the iTerm2 tab/session name.
+  local name
+  name=$(osascript 2>/dev/null <<EOF || true
 tell application "iTerm2"
   repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        set sid to unique id of s
-        if sid is in "$iterm_id" or "$iterm_id" is in sid then
-          return name of s
-        end if
+    try
+      repeat with t in tabs of w
+        try
+          repeat with s in sessions of t
+            try
+              if tty of s is "$raw_tty" then
+                return name of s
+              end if
+            end try
+          end repeat
+        end try
       end repeat
-    end repeat
+    end try
   end repeat
 end tell
 EOF
+)
+  printf 'tty:%s\n%s\n' "$raw_tty" "$name"
 }
 
 # ── Notification flow ──────────────────────────────────────────────
 HOOK_TYPE="${1:-stop}"
 PAYLOAD=$(cat)
+log "invoked: hook=$HOOK_TYPE pid=$$ ITERM_SESSION_ID=${ITERM_SESSION_ID:-<unset>}"
 
-# Extract working directory → project name
 CWD=$(/usr/bin/python3 -c "
 import sys, json
 print(json.load(sys.stdin).get('cwd', ''))
 " <<< "$PAYLOAD" 2>/dev/null || echo "")
 PROJECT=$(basename "${CWD:-unknown}")
 
-# For Stop hooks, skip if Claude is looping from a previous stop hook
-if [ "$HOOK_TYPE" = "stop" ]; then
-  ACTIVE=$(/usr/bin/python3 -c "
-import sys, json
-print(json.load(sys.stdin).get('stop_hook_active', False))
-" <<< "$PAYLOAD" 2>/dev/null || echo "False")
-  [ "$ACTIVE" = "True" ] && exit 0
-fi
-
-# Build title and message based on hook type
 case "$HOOK_TYPE" in
   stop)
     TITLE="$PROJECT"
@@ -106,27 +257,43 @@ print(json.load(sys.stdin).get('message', 'Claude has a question'))
     ;;
 esac
 
-# iTerm session ID inherited from Claude Code's shell environment
-ITERM_ID="${ITERM_SESSION_ID:-}"
+{ IFS= read -r TARGET; IFS= read -r SUBTITLE; } < <(identify_target)
+log "TARGET=$TARGET SUBTITLE=$SUBTITLE"
 
-ARGS=(-title "$TITLE" -message "$MSG" -sound default)
+# Determine which iTerm2 tty currently shows this session (empty if detached).
+case "$TARGET" in
+  tty:*) ITERM_TTY="${TARGET#tty:}" ;;
+  tmux:*)
+    SESSION="${TARGET#tmux:}"
+    ITERM_TTY=$(tmux list-clients -F '#{client_tty}|#{session_name}' 2>/dev/null \
+      | awk -F'|' -v s="$SESSION" '$2 == s {print $1; exit}')
+    ;;
+  *) ITERM_TTY="" ;;
+esac
 
-# Add iTerm tab title as subtitle
-if [ -n "$ITERM_ID" ]; then
-  TAB_TITLE=$(get_tab_title "$ITERM_ID")
-  if [ -n "$TAB_TITLE" ]; then
-    ARGS+=(-subtitle "$TAB_TITLE")
-  fi
+# Skip redundant notifications when the user is already viewing this session.
+if [ "${NOTIFY_ALWAYS:-}" != "1" ] && user_is_watching "$ITERM_TTY"; then
+  log "user is watching $ITERM_TTY — skipping notification"
+  exit 0
 fi
 
-if [ -n "$ITERM_ID" ]; then
-  # Group by session so new notifications replace stale ones
-  ARGS+=(-group "claude-${ITERM_ID}")
-  # On click, call this script back with --focus to switch to the right tab
-  ARGS+=(-execute "$HOME/.claude/hooks/notify.sh --focus '$ITERM_ID'")
+# Debounce Stop notifications so OMC loop modes don't ping every iteration.
+# Permission/Question are explicit attention requests and are never debounced.
+if [ "$HOOK_TYPE" = "stop" ] && [ -n "$TARGET" ] && ! debounce_ok "$TARGET"; then
+  log "debounced (notified within ${DEBOUNCE_SECONDS}s) — skipping"
+  exit 0
+fi
+
+ARGS=(-title "$TITLE" -message "$MSG" -sound default)
+[ -n "$SUBTITLE" ] && ARGS+=(-subtitle "$SUBTITLE")
+
+if [ -n "$TARGET" ]; then
+  ARGS+=(-group "claude-${TARGET}")
+  ARGS+=(-execute "$HOME/.claude/hooks/notify.sh --focus '$TARGET'")
 else
-  # No session ID — just activate iTerm2
   ARGS+=(-activate com.googlecode.iterm2)
 fi
 
+log "terminal-notifier: title=$TITLE target=$TARGET"
 terminal-notifier "${ARGS[@]}"
+log "done"
