@@ -18,7 +18,7 @@ teardown
 # ── Click-to-focus: attached tmux session ──────────────────────────
 test_case "--focus tmux: (attached) focuses the client's iTerm2 tty"
 setup
-mock tmux 'case "$1" in list-clients) echo "/dev/ttys8|sess1" ;; esac'
+mock tmux 'case "$1" in list-clients) printf "/dev/ttys8\tsess1\n" ;; esac'
 mock osascript 'echo yes'
 run_notify bash "$NOTIFY" --focus 'tmux:sess1' </dev/null
 assert_contains "$(mock_args tmux)" "list-clients" "queried tmux clients"
@@ -59,8 +59,8 @@ test_case "stop in a tmux pane builds a tmux: target with pane-title subtitle"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 mock tmux 'case "$1" in
-  list-panes) echo "/dev/ttys9|omc-proj-main-001|the task title" ;;
-  list-clients) echo "/dev/ttys8|omc-proj-main-001" ;;
+  list-panes) printf "/dev/ttys9\tomc-proj-main-001\tthe task title\n" ;;
+  list-clients) printf "/dev/ttys8\tomc-proj-main-001\n" ;;
 esac'
 mock osascript 'echo Finder'   # frontmost != iTerm2 -> not watching
 mock terminal-notifier 'true'
@@ -90,8 +90,8 @@ test_case "second stop within the window is debounced"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 mock tmux 'case "$1" in
-  list-panes) echo "/dev/ttys9|sessX|one" ;;
-  list-clients) echo "/dev/ttys8|sessX" ;;
+  list-panes) printf "/dev/ttys9\tsessX\tone\n" ;;
+  list-clients) printf "/dev/ttys8\tsessX\n" ;;
 esac'
 mock osascript 'echo Finder'
 mock terminal-notifier 'true'
@@ -105,8 +105,8 @@ test_case "two rapid permission prompts both notify"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 mock tmux 'case "$1" in
-  list-panes) echo "/dev/ttys9|sessY|one" ;;
-  list-clients) echo "/dev/ttys8|sessY" ;;
+  list-panes) printf "/dev/ttys9\tsessY\tone\n" ;;
+  list-clients) printf "/dev/ttys8\tsessY\n" ;;
 esac'
 mock osascript 'echo Finder'
 mock terminal-notifier 'true'
@@ -143,8 +143,8 @@ mock ps 'case "$*" in
   *"-o ppid="*) echo 2 ;;
 esac'
 mock tmux 'case "$1" in
-  list-panes) echo "/dev/ttys9|sx|t" ;;
-  list-clients) echo "/dev/ttys8|sx" ;;
+  list-panes) printf "/dev/ttys9\tsx\tt\n" ;;
+  list-clients) printf "/dev/ttys8\tsx\n" ;;
 esac'
 mock osascript 'echo Finder'
 mock terminal-notifier 'true'
@@ -168,13 +168,60 @@ teardown
 test_case "stop after the debounce window notifies again"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
-mock tmux 'case "$1" in list-panes) echo "/dev/ttys9|sz|t" ;; list-clients) echo "/dev/ttys8|sz" ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tsz\tt\n" ;; list-clients) printf "/dev/ttys8\tsz\n" ;; esac'
 mock osascript 'echo Finder'
 mock terminal-notifier 'true'
 NOTIFY_DEBOUNCE_SECONDS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
-sleep 2
+sleep 3
 NOTIFY_DEBOUNCE_SECONDS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 assert_eq 2 "$(mock_calls terminal-notifier)" "both stops notify once window elapses"
+teardown
+
+# ── Detached tmux session still notifies (notification flow) ───────
+test_case "stop on a detached tmux session notifies with a tmux: callback"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+# Pane exists, but no client is attached (detached background session).
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tomc-bg-001\tworking\n" ;;
+  list-clients) : ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/bg","stop_hook_active":false}'
+tn="$(mock_args terminal-notifier)"
+assert_eq 1 "$(mock_calls terminal-notifier)" "detached session still notifies"
+assert_contains "$tn" "--focus 'tmux:omc-bg-001'" "callback carries the session handle"
+assert_not_contains "$tn" "-activate" "uses the tmux callback, not bare activate"
+teardown
+
+# ── A watched session suppresses even a question prompt ────────────
+test_case "question on the watched tab is suppressed"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'case "$* $__stdin" in
+  *frontmost*) echo iTerm2 ;;
+  *"current session of current window"*) echo /dev/ttys9 ;;
+  *) echo myterm ;;
+esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" question <<<'{"cwd":"/x/p","message":"which?"}'
+assert_eq 0 "$(mock_calls terminal-notifier)" "watched question is suppressed"
+teardown
+
+# ── Apostrophe in session name round-trips through the callback ────
+test_case "session name with an apostrophe is shell-escaped in the callback"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tbobs\x27 sess\ttitle\n" ;;
+  list-clients) printf "/dev/ttys8\tbobs\x27 sess\n" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+# sq_escape turns tmux:bobs' sess into a safely single-quotable form.
+assert_contains "$(mock_args terminal-notifier)" "--focus 'tmux:bobs'\\''" "apostrophe is shell-escaped"
 teardown
 
 # ── tmux session name with spaces survives parsing ─────────────────
@@ -182,8 +229,8 @@ test_case "session name with spaces is parsed correctly"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 mock tmux 'case "$1" in
-  list-panes) echo "/dev/ttys9|my session|some title here" ;;
-  list-clients) echo "/dev/ttys8|my session" ;;
+  list-panes) printf "/dev/ttys9\tmy session\tsome title here\n" ;;
+  list-clients) printf "/dev/ttys8\tmy session\n" ;;
 esac'
 mock osascript 'echo Finder'
 mock terminal-notifier 'true'

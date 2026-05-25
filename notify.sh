@@ -102,8 +102,8 @@ if [ "${1:-}" = "--focus" ]; then
     tmux:*)
       SESSION="${TARGET#tmux:}"
       # Resolve the *currently* attached client (iTerm2 tty), if any.
-      CLIENT_TTY=$(tmux list-clients -F '#{client_tty}|#{session_name}' 2>/dev/null \
-        | awk -F'|' -v s="$SESSION" '$2 == s {print $1; exit}')
+      CLIENT_TTY=$(tmux list-clients -F $'#{client_tty}\t#{session_name}' 2>/dev/null \
+        | awk -F'\t' -v s="$SESSION" '$2 == s {print $1; exit}')
       if [ -n "$CLIENT_TTY" ]; then
         log "--focus: tmux '$SESSION' attached at $CLIENT_TTY -> $(focus_iterm_tty "$CLIENT_TTY")"
       else
@@ -194,13 +194,14 @@ identify_target() {
   # Is this tty a tmux pane? If so the durable handle is the session name,
   # and the human-friendly subtitle is the pane title (the Claude activity).
   if command -v tmux >/dev/null 2>&1; then
-    # Use a '|' delimiter so session names / pane titles with spaces survive.
+    # Use a TAB delimiter: tmux allows spaces and '|' in session names/titles,
+    # but not tabs, so this survives any legal name.
     local line session title
-    line=$(tmux list-panes -a -F '#{pane_tty}|#{session_name}|#{pane_title}' 2>/dev/null \
-      | awk -F'|' -v t="$raw_tty" '$1 == t {print; exit}')
+    line=$(tmux list-panes -a -F $'#{pane_tty}\t#{session_name}\t#{pane_title}' 2>/dev/null \
+      | awk -F'\t' -v t="$raw_tty" '$1 == t {print; exit}')
     if [ -n "$line" ]; then
-      session=$(printf '%s' "$line" | cut -d'|' -f2)
-      title=$(printf '%s' "$line" | cut -d'|' -f3-)
+      session=$(printf '%s' "$line" | cut -d$'\t' -f2)
+      title=$(printf '%s' "$line" | cut -d$'\t' -f3-)
       printf 'tmux:%s\n%s\n' "$session" "${title:-$session}"
       return
     fi
@@ -275,8 +276,8 @@ case "$TARGET" in
   tty:*) ITERM_TTY="${TARGET#tty:}" ;;
   tmux:*)
     SESSION="${TARGET#tmux:}"
-    ITERM_TTY=$(tmux list-clients -F '#{client_tty}|#{session_name}' 2>/dev/null \
-      | awk -F'|' -v s="$SESSION" '$2 == s {print $1; exit}')
+    ITERM_TTY=$(tmux list-clients -F $'#{client_tty}\t#{session_name}' 2>/dev/null \
+      | awk -F'\t' -v s="$SESSION" '$2 == s {print $1; exit}')
     ;;
   *) ITERM_TTY="" ;;
 esac
