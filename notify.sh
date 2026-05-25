@@ -35,6 +35,19 @@ else
   log() { :; }
 fi
 
+# ── osascript wrapper with a timeout ───────────────────────────────
+# An unresponsive/modal iTerm2 can make osascript hang indefinitely, which
+# would stall this hook (Claude Code may kill a slow hook). Bound it with
+# timeout/gtimeout when available; fall back to a bare call otherwise.
+OSA_TIMEOUT_BIN=$(command -v gtimeout || command -v timeout || true)
+osa() {
+  if [ -n "$OSA_TIMEOUT_BIN" ]; then
+    "$OSA_TIMEOUT_BIN" 5 osascript "$@"
+  else
+    osascript "$@"
+  fi
+}
+
 # ── Escaping helpers ───────────────────────────────────────────────
 # Escape a string for embedding in an AppleScript double-quoted literal.
 as_escape() { local s=${1//\\/\\\\}; printf '%s' "${s//\"/\\\"}"; }
@@ -45,7 +58,7 @@ sq_escape() { printf '%s' "${1//\'/\'\\\'\'}"; }
 # Returns "yes" on success, "no" if no matching tty is currently visible.
 focus_iterm_tty() {
   local target_tty="$1"
-  osascript 2>/dev/null <<EOF || echo "no"
+  osa 2>/dev/null <<EOF || echo "no"
 tell application "iTerm2"
   activate
   repeat with w in windows
@@ -76,7 +89,7 @@ EOF
 open_iterm_tab() {
   local cmd
   cmd=$(as_escape "$1")
-  osascript 2>/dev/null <<EOF || true
+  osa 2>/dev/null <<EOF || true
 tell application "iTerm2"
   activate
   if (count of windows) > 0 then
@@ -113,7 +126,7 @@ if [ "${1:-}" = "--focus" ]; then
           open_iterm_tab "tmux attach-session -t '$(sq_escape "$SESSION")'"
         else
           log "--focus: tmux '$SESSION' no longer exists"
-          osascript -e 'tell application "iTerm2" to activate' 2>/dev/null || true
+          osa -e 'tell application "iTerm2" to activate' 2>/dev/null || true
         fi
       fi
       ;;
@@ -131,7 +144,7 @@ user_is_watching() {
   local iterm_tty="$1"
   [ -z "$iterm_tty" ] && return 1
   local front
-  front=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || echo "")
+  front=$(osa -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || echo "")
   [ "$front" != "iTerm2" ] && return 1
   local cur
   cur=$(osascript 2>/dev/null <<EOF || true
@@ -156,6 +169,9 @@ debounce_ok() {
   key=$(printf '%s' "$target" | shasum 2>/dev/null | cut -c1-40)
   [ -z "$key" ] && key=$(printf '%s' "$target" | tr -c 'a-zA-Z0-9' '_')
   mkdir -p "$DEBOUNCE_DIR"
+  # Opportunistically reap stamps older than a day so unique tmux session
+  # names (e.g. OMC's timestamped sessions) don't accumulate indefinitely.
+  find "$DEBOUNCE_DIR" -type f -mtime +1 -delete 2>/dev/null || true
   stamp="$DEBOUNCE_DIR/$key"
   now=$(date +%s)
   if [ -f "$stamp" ]; then

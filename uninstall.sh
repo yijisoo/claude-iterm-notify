@@ -19,7 +19,7 @@ fi
 # ── 2. Remove hooks from settings.json ───────────────────────────
 if [ -f "$SETTINGS" ]; then
   /usr/bin/python3 - "$SETTINGS" << 'PYREMOVE'
-import json, sys
+import json, sys, os
 
 settings_path = sys.argv[1]
 
@@ -57,9 +57,11 @@ if not settings.get("hooks"):
     settings.pop("hooks", None)
 
 if changed:
-    with open(settings_path, "w") as f:
+    tmp_path = settings_path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
+    os.replace(tmp_path, settings_path)
     print("[ok] Removed hooks from " + settings_path)
 else:
     print("[--] No notify.sh hooks found in settings.json")
