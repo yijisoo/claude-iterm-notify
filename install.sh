@@ -41,12 +41,18 @@ import json, sys, os
 
 settings_path = sys.argv[1]
 
-# Read existing settings
+# Read existing settings. A missing file is fine (start fresh), but a file
+# that exists with invalid JSON must NOT be overwritten — that would destroy
+# the user's real config over a transient syntax error. Abort instead.
 try:
     with open(settings_path) as f:
         settings = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
     settings = {}
+except json.JSONDecodeError as e:
+    print("[!!] " + settings_path + " is not valid JSON (" + str(e) + ").")
+    print("[!!] Refusing to overwrite it. Fix the JSON and re-run.")
+    sys.exit(1)
 
 # The hooks we want to add
 notify_hooks = {
@@ -98,9 +104,13 @@ for event, entries in notify_hooks.items():
             changed = True
 
 if changed:
-    with open(settings_path, "w") as f:
+    # Atomic write: dump to a temp file then rename, so a crash mid-write
+    # can't leave a truncated settings.json.
+    tmp_path = settings_path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
+    os.replace(tmp_path, settings_path)
     print("[ok] Added hooks to " + settings_path)
 else:
     print("[ok] Hooks already present in " + settings_path)

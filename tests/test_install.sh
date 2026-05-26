@@ -104,4 +104,17 @@ fi
 assert_eq 0 "$(count_hook 'notify.sh')" "hooks still removed despite no tty"
 teardown
 
+# ── install must NOT clobber a settings.json with invalid JSON ─────
+test_case "install aborts on invalid JSON and leaves the file untouched"
+setup; prepare_home
+printf '{ "permissions": { "allow": ["Bash"] }, }\n' > "$SETTINGS"   # trailing comma = invalid
+before=$(cat "$SETTINGS")
+if run_install; then
+  fail "install should have exited non-zero on invalid JSON"
+else
+  pass "install exited non-zero on invalid JSON"
+fi
+assert_eq "$before" "$(cat "$SETTINGS")" "settings.json left untouched (no data loss)"
+teardown
+
 finish
