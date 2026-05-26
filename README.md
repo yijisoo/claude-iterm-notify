@@ -26,7 +26,7 @@ Native macOS notifications when [Claude Code](https://docs.anthropic.com/en/docs
 ## Install
 
 ```bash
-git clone https://github.com/stevemeisner/claude-iterm-notify.git
+git clone https://github.com/yijisoo/claude-iterm-notify.git
 cd claude-iterm-notify
 ./install.sh
 ```
