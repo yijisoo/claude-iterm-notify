@@ -1,13 +1,12 @@
 #!/bin/bash
 # macOS notifications for Claude Code / OMC with iTerm2 click-to-focus.
 #
-# Works for three session topologies:
-#   1. claude running directly in an iTerm2 tab        -> focus that tab
-#   2. claude running in a tmux session shown in a tab -> focus that tab
-#   3. claude in a *detached* tmux session (OMC bg)    -> attach in a new tab
-#
-# The durable handle is the tmux session name (survives detach/reattach);
-# the iTerm2 tab is only a *current* view of it, resolved at click time.
+# Notify only when the firing session is shown in a live iTerm2 tab, and target
+# that tab directly. Two cases produce a notification:
+#   1. Claude running directly in an iTerm2 tab        -> target that tab
+#   2. Claude in a tmux session attached to a tab      -> target the client tab
+# A tmux session with NO attached client (an OMC worker/subagent or a stale,
+# detached run) has no tab to land on, so it is intentionally NOT notified.
 #
 # Usage (Claude Code hooks):
 #   echo '{"cwd":"/path"}' | notify.sh stop
@@ -16,7 +15,6 @@
 #
 # Click callback (terminal-notifier):
 #   notify.sh --focus 'tty:/dev/ttysNNN'
-#   notify.sh --focus 'tmux:<session-name>'
 
 set -euo pipefail
 
@@ -64,9 +62,6 @@ iterm_running() {
   [ "$ITERM_RUNNING_CACHE" = "yes" ]
 }
 
-# ── Escaping helpers ───────────────────────────────────────────────
-# Escape a string for embedding in an AppleScript double-quoted literal.
-as_escape() { local s=${1//\\/\\\\}; printf '%s' "${s//\"/\\\"}"; }
 # Escape a string for embedding inside single quotes in a shell command.
 sq_escape() { printf '%s' "${1//\'/\'\\\'\'}"; }
 
@@ -101,66 +96,15 @@ end tell
 EOF
 }
 
-# ── AppleScript: open a new iTerm2 tab running a command ────────────
-open_iterm_tab() {
-  local cmd
-  cmd=$(as_escape "$1")
-  osa 2>/dev/null <<EOF || true
-tell application "iTerm2"
-  activate
-  if (count of windows) > 0 then
-    tell current window to create tab with default profile command "$cmd"
-  else
-    create window with default profile command "$cmd"
-  end if
-end tell
-EOF
-}
-
 # ── Click-to-focus callback ────────────────────────────────────────
 if [ "${1:-}" = "--focus" ]; then
   TARGET="${2:-}"
-  [ -z "$TARGET" ] && exit 0
-  log "--focus: target=$TARGET"
-
   case "$TARGET" in
     tty:*)
       TTY_PATH="${TARGET#tty:}"
-      log "--focus: direct tty $TTY_PATH -> $(focus_iterm_tty "$TTY_PATH")"
+      log "--focus: tty $TTY_PATH -> $(focus_iterm_tty "$TTY_PATH")"
       ;;
-    tmux:*)
-      SESSION="${TARGET#tmux:}"
-      # Resolve the *currently* attached client (iTerm2 tty), if any.
-      CLIENT_TTY=$(tmux list-clients -F $'#{client_tty}\t#{session_name}' 2>/dev/null \
-        | awk -F'\t' -v s="$SESSION" '$2 == s {print $1; exit}' || true)
-      if [ -n "$CLIENT_TTY" ]; then
-        log "--focus: tmux '$SESSION' attached at $CLIENT_TTY -> $(focus_iterm_tty "$CLIENT_TTY")"
-      else
-        # Detached: no iTerm tab currently shows this session. OMC sessions
-        # detach/reattach constantly, so rather than spawning a new tab every
-        # time, reuse an existing tmux tab — point one of its clients at this
-        # session (tmux switch-client) and focus that iTerm tab.
-        if tmux has-session -t "$SESSION" 2>/dev/null; then
-          REUSE_TTY=$(tmux list-clients -F '#{client_tty}' 2>/dev/null | head -n1 || true)
-          if [ -n "$REUSE_TTY" ] && tmux switch-client -c "$REUSE_TTY" -t "$SESSION" 2>/dev/null; then
-            log "--focus: tmux '$SESSION' detached -> switched client $REUSE_TTY -> $(focus_iterm_tty "$REUSE_TTY")"
-          else
-            # No existing tmux client to reuse -> attach in a new tab.
-            # iTerm2 runs the tab command via execvp with NO shell and NO PATH
-            # search, so tmux must be an absolute path.
-            log "--focus: tmux '$SESSION' detached, no client to reuse -> new tab"
-            TMUX_BIN=$(command -v tmux 2>/dev/null || echo tmux)
-            open_iterm_tab "$TMUX_BIN attach-session -t '$SESSION'"
-          fi
-        else
-          log "--focus: tmux '$SESSION' no longer exists"
-          osa -e 'tell application "iTerm2" to activate' 2>/dev/null || true
-        fi
-      fi
-      ;;
-    *)
-      log "--focus: unknown target scheme"
-      ;;
+    *) log "--focus: nothing to do (target=$TARGET)" ;;
   esac
   exit 0
 fi
@@ -175,7 +119,7 @@ user_is_watching() {
   front=$(osa -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || echo "")
   [ "$front" != "iTerm2" ] && return 1
   local cur
-  cur=$(osascript 2>/dev/null <<EOF || true
+  cur=$(osa 2>/dev/null <<EOF || true
 tell application "iTerm2"
   try
     return tty of current session of current window
@@ -186,19 +130,19 @@ EOF
   [ "$cur" = "$iterm_tty" ]
 }
 
-# ── Debounce: true (notify) if this target wasn't notified recently ──
+# ── Debounce: true (notify) if this key wasn't notified recently ─────
 # OMC loop modes (ralph/autopilot) make Claude stop-and-continue rapidly;
 # without this every iteration would ping. One notification per window.
+# Keyed on a DURABLE id (tmux session name, or tty for direct) so it survives
+# the session being reattached to a different tab.
 DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-180}"
 DEBOUNCE_DIR="${NOTIFY_DEBOUNCE_DIR:-/tmp/claude-iterm-notify-debounce}"
 debounce_ok() {
-  local target="$1" key stamp now mtime
-  # Hash the target so distinct sessions never collide on a sanitized key.
-  key=$(printf '%s' "$target" | shasum 2>/dev/null | cut -c1-40)
-  [ -z "$key" ] && key=$(printf '%s' "$target" | tr -c 'a-zA-Z0-9' '_')
+  local key_in="$1" key stamp now mtime
+  key=$(printf '%s' "$key_in" | shasum 2>/dev/null | cut -c1-40)
+  [ -z "$key" ] && key=$(printf '%s' "$key_in" | tr -c 'a-zA-Z0-9' '_')
   mkdir -p "$DEBOUNCE_DIR"
-  # Opportunistically reap stamps older than a day so unique tmux session
-  # names (e.g. OMC's timestamped sessions) don't accumulate indefinitely.
+  # Opportunistically reap old stamps so they don't accumulate indefinitely.
   find "$DEBOUNCE_DIR" -type f -mtime +1 -delete 2>/dev/null || true
   stamp="$DEBOUNCE_DIR/$key"
   now=$(date +%s)
@@ -223,35 +167,44 @@ get_tty() {
   done
 }
 
-# ── Identify the session. Echoes two lines: TARGET then SUBTITLE. ──
-# TARGET is "tmux:<name>" or "tty:<path>" (empty if no tty found).
-identify_target() {
+# ── Resolve the iTerm2 tab for the firing session ──────────────────
+# Echoes three lines: TARGET, SUBTITLE, DEBOUNCE_KEY.
+#   TARGET   = "tty:<iterm-tty>"  -> notify and focus that tab
+#            = "SKIP"             -> tmux session has no tab; do NOT notify
+#            = ""                 -> no controlling tty; notify, just raise iTerm
+resolve_tab() {
   local raw_tty
   raw_tty=$(get_tty)
   log "raw_tty=$raw_tty"
   if [ -z "$raw_tty" ]; then
-    printf '\n\n'
+    printf '\n\n\n'
     return
   fi
 
-  # Is this tty a tmux pane? If so the durable handle is the session name,
-  # and the human-friendly subtitle is the pane title (the Claude activity).
+  # Is this tty a tmux pane? Then the tab is whatever client is attached to the
+  # pane's session. No client => worker/subagent/stale run => no tab => SKIP.
+  # TAB delimiter: tmux allows spaces and '|' in names, but never tabs.
   if command -v tmux >/dev/null 2>&1; then
-    # Use a TAB delimiter: tmux allows spaces and '|' in session names/titles,
-    # but not tabs, so this survives any legal name.
-    local line session title
+    local line session title client
     line=$(tmux list-panes -a -F $'#{pane_tty}\t#{session_name}\t#{pane_title}' 2>/dev/null \
       | awk -F'\t' -v t="$raw_tty" '$1 == t {print; exit}' || true)
     if [ -n "$line" ]; then
       session=$(printf '%s' "$line" | cut -d$'\t' -f2)
       title=$(printf '%s' "$line" | cut -d$'\t' -f3-)
-      printf 'tmux:%s\n%s\n' "$session" "${title:-$session}"
+      client=$(tmux list-clients -F $'#{client_tty}\t#{session_name}' 2>/dev/null \
+        | awk -F'\t' -v s="$session" '$2 == s {print $1; exit}' || true)
+      if [ -z "$client" ]; then
+        log "tmux session '$session' has no attached tab -> skipping"
+        printf 'SKIP\n\n\n'
+        return
+      fi
+      printf 'tty:%s\n%s\n%s\n' "$client" "${title:-$session}" "$session"
       return
     fi
   fi
 
-  # Direct iTerm2 session. Subtitle = the iTerm2 tab/session name.
-  # Skip the query (and avoid launching iTerm2) if it isn't already running.
+  # Direct iTerm2 session (not a tmux pane). Subtitle = iTerm2 session name,
+  # queried only if iTerm2 is running (so we never launch it).
   local name=""
   if iterm_running; then
     name=$(osa 2>/dev/null <<EOF || true
@@ -275,7 +228,7 @@ end tell
 EOF
 )
   fi
-  printf 'tty:%s\n%s\n' "$raw_tty" "$name"
+  printf 'tty:%s\n%s\n%s\n' "$raw_tty" "$name" "$raw_tty"
 }
 
 # ── Notification flow ──────────────────────────────────────────────
@@ -316,21 +269,17 @@ print(str(m)[:200])
     ;;
 esac
 
-{ IFS= read -r TARGET; IFS= read -r SUBTITLE; } < <(identify_target)
-log "TARGET=$TARGET SUBTITLE=$SUBTITLE"
+{ IFS= read -r TARGET; IFS= read -r SUBTITLE; IFS= read -r DEBOUNCE_KEY; } < <(resolve_tab)
+log "TARGET=$TARGET SUBTITLE=$SUBTITLE DEBOUNCE_KEY=$DEBOUNCE_KEY"
 
-# Determine which iTerm2 tty currently shows this session (empty if detached).
-case "$TARGET" in
-  tty:*) ITERM_TTY="${TARGET#tty:}" ;;
-  tmux:*)
-    SESSION="${TARGET#tmux:}"
-    ITERM_TTY=$(tmux list-clients -F $'#{client_tty}\t#{session_name}' 2>/dev/null \
-      | awk -F'\t' -v s="$SESSION" '$2 == s {print $1; exit}' || true)
-    ;;
-  *) ITERM_TTY="" ;;
-esac
+# Tab-less tmux session (worker/subagent/stale run) -> do not notify at all.
+if [ "$TARGET" = "SKIP" ]; then
+  exit 0
+fi
 
-# Skip redundant notifications when the user is already viewing this session.
+ITERM_TTY="${TARGET#tty:}"   # the tab's tty (empty if TARGET is empty)
+
+# Skip redundant notifications when the user is already viewing this tab.
 if [ "${NOTIFY_ALWAYS:-}" != "1" ] && user_is_watching "$ITERM_TTY"; then
   log "user is watching $ITERM_TTY — skipping notification"
   exit 0
@@ -338,7 +287,7 @@ fi
 
 # Debounce Stop notifications so OMC loop modes don't ping every iteration.
 # Permission/Question are explicit attention requests and are never debounced.
-if [ "$HOOK_TYPE" = "stop" ] && [ -n "$TARGET" ] && ! debounce_ok "$TARGET"; then
+if [ "$HOOK_TYPE" = "stop" ] && [ -n "$DEBOUNCE_KEY" ] && ! debounce_ok "$DEBOUNCE_KEY"; then
   log "debounced (notified within ${DEBOUNCE_SECONDS}s) — skipping"
   exit 0
 fi
@@ -347,7 +296,7 @@ ARGS=(-title "$TITLE" -message "$MSG" -sound default)
 [ -n "$SUBTITLE" ] && ARGS+=(-subtitle "$SUBTITLE")
 
 if [ -n "$TARGET" ]; then
-  ARGS+=(-group "claude-${TARGET}")
+  ARGS+=(-group "claude-${DEBOUNCE_KEY:-$TARGET}")
   ARGS+=(-execute "$HOME/.claude/hooks/notify.sh --focus '$(sq_escape "$TARGET")'")
 else
   ARGS+=(-activate com.googlecode.iterm2)

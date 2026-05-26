@@ -53,28 +53,27 @@ Removes the hook script and this tool's hook entries from your settings (other h
 
 Claude Code's [hook system](https://docs.anthropic.com/en/docs/claude-code/hooks) runs `notify.sh` on specific events. Rather than relying on `ITERM_SESSION_ID` (which is unreliable inside tmux), the script identifies the session by its **controlling tty** and resolves the focusable tab **at click time**, because tab↔session attachment is dynamic.
 
+The guiding rule: **notify only when the firing session is shown in a live iTerm2 tab, and target that tab directly.** See [docs/notification-targeting.md](docs/notification-targeting.md) for the full design.
+
 **When a notification fires:**
 1. Read the hook's JSON payload from stdin (working directory → project name, message, etc.).
 2. Walk up the process tree to find the controlling tty of the `claude` process.
-3. Pick a durable handle:
-   - tty is a **tmux pane** → use the **tmux session name** (survives detach/reattach); subtitle = pane title.
-   - otherwise → use the **iTerm2 tty** directly; subtitle = iTerm2 session name.
-4. If you're already watching that session (iTerm2 frontmost + that tab selected), **skip** the notification.
-5. Otherwise fire `terminal-notifier` with a click callback carrying the handle.
+3. Resolve the iTerm2 tab:
+   - tty is a **tmux pane** → find the tab attached to that pane's session; subtitle = pane title. If the session has **no attached tab** (an OMC worker/subagent or a stale, detached run), **do not notify** — there's nothing to land on.
+   - otherwise → Claude is **directly in an iTerm2 tab**; target that tty, subtitle = iTerm2 session name.
+4. Skip if you're already watching that tab, or if it pinged recently (debounce).
+5. Otherwise fire `terminal-notifier` with a `tty:` click callback.
 
-**When you click:**
-- `tty:<path>` → focus the iTerm2 tab with that tty.
-- `tmux:<session>` attached → focus the iTerm2 tab currently showing it.
-- `tmux:<session>` detached → open a new tab and `tmux attach` to it (great for OMC background agents).
+**When you click:** focus the iTerm2 tab with that tty.
 
 ```
 Claude Code hook fires
-  → notify.sh finds the session's tty (+ tmux session if any)
-  → suppressed if you're already watching it
-  → debounced if it pinged for this session recently
+  → notify.sh resolves the iTerm2 tab for the session (tty)
+  → tab-less tmux session (worker/subagent) → no notification
+  → suppressed if you're already watching that tab
+  → debounced if it pinged recently (keyed on the durable session name)
   → terminal-notifier shows the notification
-  → you click
-  → notify.sh --focus resolves the current tab and switches to it
+  → you click → notify.sh --focus selects that tab
 ```
 
 ## Hooks Configured
@@ -87,7 +86,9 @@ Claude Code hook fires
 
 ## tmux & OMC
 
-If Claude runs inside a tmux session (as [oh-my-claudecode](https://github.com/) does — one tmux session per agent), the tab you see is just a *client* attached to that session. `notify.sh` maps `pane tty → tmux session → attached client tty → iTerm2 tab`, so click-to-focus lands on the right tab. If the session is **detached** when you click, it's re-attached in a new tab.
+If Claude runs inside a tmux session (as [oh-my-claudecode](https://github.com/) does — one tmux session per agent), the tab you see is just a *client* attached to that session. `notify.sh` maps `pane tty → tmux session → attached client tty → iTerm2 tab`, so click-to-focus lands on the right tab.
+
+Sessions with **no attached tab** — OMC background workers/subagents, or stale runs you've moved on from — are intentionally **not** notified: there is no tab to take you to, and an active run always has its tab. This keeps notifications tied to things you can actually click into, and avoids spawning or hijacking tabs.
 
 `tmux` is found even from terminal-notifier's minimal-PATH click callback (the script prepends Homebrew's bin).
 
@@ -118,7 +119,7 @@ A dependency-free test suite (pure bash, no `bats`) lives in `tests/`. It runs `
 
 (The harness sets `NOTIFY_TEST=1` so `notify.sh` skips its Homebrew PATH prepend and the mock tools on `PATH` take effect.)
 
-Covers: click-to-focus routing (direct tty / attached tmux / detached tmux / missing session), session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, stop debouncing, and the install/uninstall settings.json merge & removal logic.
+Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing, and the install/uninstall settings.json merge & removal logic.
 
 ## Files
 
