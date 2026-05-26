@@ -1,6 +1,6 @@
 # Claude Code iTerm2 Notifications
 
-Native macOS notifications when [Claude Code](https://docs.anthropic.com/en/docs/claude-code) needs your attention, with click-to-focus that takes you to the exact iTerm2 tab — including sessions running inside **tmux** (e.g. [oh-my-claudecode](https://github.com/) orchestration).
+Native macOS notifications when [Claude Code](https://docs.anthropic.com/en/docs/claude-code) needs your attention, with click-to-focus that takes you to the exact iTerm2 tab — including sessions running inside **tmux** (e.g. [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) orchestration).
 
 ## What You Get
 
@@ -86,7 +86,7 @@ Claude Code hook fires
 
 ## tmux & OMC
 
-If Claude runs inside a tmux session (as [oh-my-claudecode](https://github.com/) does — one tmux session per agent), the tab you see is just a *client* attached to that session. `notify.sh` maps `pane tty → tmux session → attached client tty → iTerm2 tab`, so click-to-focus lands on the right tab.
+If Claude runs inside a tmux session (as [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) does — one tmux session per agent), the tab you see is just a *client* attached to that session. `notify.sh` maps `pane tty → tmux session → attached client tty → iTerm2 tab`, so click-to-focus lands on the right tab.
 
 Sessions with **no attached tab** — OMC background workers/subagents, or stale runs you've moved on from — are intentionally **not** notified: there is no tab to take you to, and an active run always has its tab. This keeps notifications tied to things you can actually click into, and avoids spawning or hijacking tabs.
 
