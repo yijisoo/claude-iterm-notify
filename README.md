@@ -15,6 +15,7 @@ Native macOS notifications when [Claude Code](https://docs.anthropic.com/en/docs
 - **No nagging**: notifications are suppressed for a session you're already looking at, and rapid "stop" events (OMC loop modes) are debounced.
 - **No mid-work pings**: a stop that fires while the session is still visibly working (subagents running) is held and delivered when the session actually goes idle, and agent-team worker sessions don't ping at all when they finish.
 - **No silent marathons**: a session that stays busy a full heartbeat interval (10 min default) sends a truthful "Still working" ping, so long-running loops never disappear on you.
+- **No stale notifications**: if you resolve a session directly at the terminal instead of clicking through, the outdated notification is retracted from Notification Center the moment the session does anything else — you won't click an old banner later and land on a session that's already moved on.
 
 ## Requirements
 
@@ -122,6 +123,10 @@ Heartbeats bypass and never consume the stop debounce, so the real "Ready for in
 Both mechanisms hold or suppress only on a **positive** match, so they fail safe: if a future Claude Code changes the title glyphs or the `--agent-id` flag, the gate simply never engages and behavior reverts to notify-immediately — a notification can be late (bounded by the heartbeat interval), never silently lost.
 The event log below doubles as the canary: if mid-work deliveries reappear after a Claude Code update, `--report` will show it.
 
+**Retracting stale notifications.**
+Every notification is tagged with a `-group` id derived from the session's durable identity (tmux session name, or tty), and every hook invocation opens by checking whether that session already has one outstanding — if so, it's removed from Notification Center via `terminal-notifier -remove` before anything else happens, regardless of whether this new event goes on to show a fresh one.
+This matters most for the case a same-session *replacement* notification doesn't cover: you resolve a permission prompt or a question directly at the terminal (not by clicking the notification), and the session goes on to do more work without immediately producing another notification (idle-gating holds it, or the next stop gets debounced) — the outdated banner would otherwise sit in Notification Center until whenever the next delivery happens to occur. Now it's cleared the moment the session shows any sign of life.
+
 **Debounce vs. cycling loop sessions.**
 There is no reliable signal for "this pause is the loop's final stop" vs. "this pause is between iterations" — loop modes (ralph/autopilot/standup-autopilot) idle and resume on their own schedule regardless of whether you act on a notification, often every few minutes.
 Notifying on every one of those idle points means most clicks land on a session that has already moved on to its next iteration by the time you get there.
@@ -176,7 +181,7 @@ A dependency-free test suite (pure bash, no `bats`) lives in `tests/`. It runs `
 
 (The harness sets `NOTIFY_TEST=1` so `notify.sh` skips its Homebrew PATH prepend and the mock tools on `PATH` take effect.)
 
-Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip on stop, still notify on permission/question / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing at its 20-min default, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
+Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip on stop, still notify on permission/question / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing at its 20-min default, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), stale-notification retraction, event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
 
 ## Files
 

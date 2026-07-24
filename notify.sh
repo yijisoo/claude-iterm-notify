@@ -262,6 +262,27 @@ debounce_ok() {
   return 0
 }
 
+# Group id used for both -group (on send) and -remove (on retraction), so the
+# two always agree. Reads the globals set by the time either call site runs.
+notify_group() { printf 'claude-%s' "${DEBOUNCE_KEY:-$TARGET}"; }
+
+# Any new hook firing for a session proves whatever notification was last
+# shown for it is now stale — the user may have resolved it directly at the
+# terminal instead of clicking through, or the session may have simply moved
+# on. Retract it before deciding whether THIS event warrants a new one.
+# Marker existence only; the group id is recomputed from the current
+# DEBOUNCE_KEY, the same stable session identity used when it was set.
+clear_stale_notification() {
+  local key_in="$1" marker
+  [ -z "$key_in" ] && return 0
+  marker="$DEBOUNCE_DIR/live-$(hash_key "$key_in")"
+  [ -f "$marker" ] || return 0
+  rm -f "$marker" 2>/dev/null || true
+  terminal-notifier -remove "$(notify_group)" >/dev/null 2>&1 || true
+  log "cleared stale notification group=$(notify_group) (new activity on this session)"
+  return 0
+}
+
 # ── Find the controlling tty by walking up the process tree ───────
 get_tty() {
   local pid=$$ t
@@ -452,6 +473,12 @@ log "TARGET=$TARGET SUBTITLE=$SUBTITLE DEBOUNCE_KEY=$DEBOUNCE_KEY RAW_TTY=$RAW_T
 # Event-log detail: what the session was doing (stop) or what it asked (rest).
 if [ "$HOOK_TYPE" = "stop" ]; then DETAIL="$SUBTITLE"; else DETAIL="$MSG"; fi
 
+# This session did something — retract whatever was last shown for it before
+# deciding whether this event itself warrants a new notification. Runs
+# ahead of every exit path (SKIP, worker-suppressed, held, debounced) so a
+# stale notification never outlives the state it described.
+clear_stale_notification "$DEBOUNCE_KEY"
+
 # Tab-less tmux session (worker/subagent/stale run): a "stop" has nothing to
 # click into, so it's not notified. Permission/Question are different — the
 # worker is genuinely blocked waiting on the user, so still notify, just
@@ -505,7 +532,7 @@ deliver_now() {
   local ARGS=(-title "$TITLE" -message "$msg" -sound default)
   if [ -n "$SUBTITLE" ]; then ARGS+=(-subtitle "$SUBTITLE"); fi
   if [ -n "$TARGET" ]; then
-    ARGS+=(-group "claude-${DEBOUNCE_KEY:-$TARGET}")
+    ARGS+=(-group "$(notify_group)")
     ARGS+=(-execute "$HOME/.claude/hooks/notify.sh --focus '$(sq_escape "$TARGET")'")
   else
     ARGS+=(-activate com.googlecode.iterm2)
@@ -515,6 +542,12 @@ deliver_now() {
   # chatter on stdout (it replaces grouped notifications on every fire), which
   # Claude Code would otherwise surface as spurious hook output.
   terminal-notifier "${ARGS[@]}" >/dev/null 2>&1 || true
+  # Mark this session's notification live so a later invocation with nothing
+  # new to show (held/debounced/suppressed) can still retract it on its own.
+  if [ -n "$DEBOUNCE_KEY" ]; then
+    mkdir -p "$DEBOUNCE_DIR" 2>/dev/null || true
+    touch "$DEBOUNCE_DIR/live-$(hash_key "$DEBOUNCE_KEY")" 2>/dev/null || true
+  fi
   event_log "$HOOK_TYPE" "$outcome" "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
   return 0
 }

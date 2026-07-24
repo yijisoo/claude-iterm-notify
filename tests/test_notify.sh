@@ -163,7 +163,7 @@ mock osascript 'echo Finder'
 mock terminal-notifier 'true'
 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
-assert_eq 1 "$(mock_calls terminal-notifier)" "only the first of two rapid stops notifies"
+assert_eq 1 "$(mock_sends terminal-notifier)" "only the first of two rapid stops notifies"
 teardown
 
 test_case "production default debounce window is 20 minutes, past typical loop cadence"
@@ -181,7 +181,7 @@ mock terminal-notifier 'true'
 NOTIFY_DEBOUNCE_SECONDS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 sleep 3
 NOTIFY_DEBOUNCE_SECONDS=1 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
-assert_eq 2 "$(mock_calls terminal-notifier)" "both stops notify once the window elapses"
+assert_eq 2 "$(mock_sends terminal-notifier)" "both stops notify once the window elapses"
 teardown
 
 # ── Permission/question are never debounced ────────────────────────
@@ -193,7 +193,7 @@ mock osascript 'echo Finder'
 mock terminal-notifier 'true'
 run_notify bash "$NOTIFY" permission <<<'{"cwd":"/x/p","message":"allow?"}'
 run_notify bash "$NOTIFY" permission <<<'{"cwd":"/x/p","message":"allow?"}'
-assert_eq 2 "$(mock_calls terminal-notifier)" "both permission prompts notify"
+assert_eq 2 "$(mock_sends terminal-notifier)" "both permission prompts notify"
 teardown
 
 test_case "question hook builds a Question title with the message"
@@ -403,6 +403,58 @@ dd if=/dev/zero of="$SANDBOX/events.tsv" bs=1024 count=600 2>/dev/null
 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 if [ -f "$SANDBOX/events.tsv.old" ]; then pass "old log rotated aside"; else fail "no .old rotation"; fi
 assert_eq 1 "$(wc -l < "$SANDBOX/events.tsv" | tr -d ' ')" "fresh log holds just the new event"
+teardown
+
+# ── Stale-notification cleanup: retract what's no longer accurate ──
+test_case "resuming activity clears the earlier notification even with no new one to show yet"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tsessR\tt\n" ;; list-clients) printf "/dev/ttys8\tsessR\n" ;; esac'
+mock osascript 'case "$* $__stdin" in *frontmost*) echo Finder ;; *"name of s"*) echo "✳ idle" ;; *) echo "" ;; esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_eq 1 "$(mock_calls terminal-notifier)" "first stop delivers"
+mock osascript 'case "$* $__stdin" in *"is running"*) echo true ;; *frontmost*) echo Finder ;; *) echo "" ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tsessR\t⠐ busy\n" ;; list-clients) printf "/dev/ttys8\tsessR\n" ;; esac'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+tn="$(mock_args terminal-notifier)"
+assert_eq 2 "$(mock_calls terminal-notifier)" "resumed activity triggers a synchronous -remove, no second send yet"
+assert_contains "$tn" "-remove claude-sessR" "the earlier notification is retracted by its group id"
+teardown
+
+test_case "a session's first-ever event never attempts a removal (nothing was live)"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'true'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_not_contains "$(mock_args terminal-notifier)" "-remove" "nothing to retract on a session's first event"
+teardown
+
+test_case "a debounced repeat still clears the stale notification from the first"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tsessB\tt\n" ;; list-clients) printf "/dev/ttys8\tsessB\n" ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+tn="$(mock_args terminal-notifier)"
+assert_eq 2 "$(mock_calls terminal-notifier)" "first send + remove, second stayed debounced (no re-send)"
+assert_contains "$tn" "-remove claude-sessB" "even a debounced repeat retracts the now-stale first notification"
+teardown
+
+test_case "a tab-less worker's suppressed stop still clears an earlier live notification"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tomc-worker\twork\n" ;; list-clients) printf "/dev/ttys8\tomc-worker\n" ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" permission <<<'{"cwd":"/x/p","message":"allow?"}'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tomc-worker\twork\n" ;; list-clients) : ;; esac'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_contains "$(mock_args terminal-notifier)" "-remove claude-omc-worker" "worker going tab-less still retracts its earlier permission ping"
 teardown
 
 # ── Worker sessions (claude --agent-id): stops off, asks on ────────
