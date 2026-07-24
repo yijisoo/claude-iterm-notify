@@ -620,6 +620,63 @@ assert_eq 0 "$(mock_calls terminal-notifier)" "watched tab not pinged at deliver
 assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\tskip_watching\t' "late suppression recorded"
 teardown
 
+# ── SessionStart title hook (opt-in) ────────────────────────────────
+# sessionTitle's actual effect on the terminal is undocumented, so this
+# doesn't depend on it at all: it sets the tmux pane title / iTerm2 session
+# name directly via well-documented primitives, gated behind an explicit
+# opt-in (this is the one place the script WRITES terminal/tmux state
+# instead of just reading it, and there's no reliable way to tell "default
+# title" from "user renamed this tab" apart).
+test_case "title hook is a no-op unless NOTIFY_SET_TITLE=1"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'true'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" title <<<'{"cwd":"/x/myproj"}'
+assert_not_contains "$(mock_args tmux)" "select-pane" "no tmux title set when opted out"
+assert_not_contains "$(mock_args osascript)$(mock_stdin osascript)" "set name" "no iTerm2 title set when opted out"
+assert_eq 0 "$(mock_calls terminal-notifier)" "title hook never fires a notification, opted in or not"
+teardown
+
+test_case "title hook sets the tmux pane title from the project name when opted in"
+setup
+mock tmux 'true'
+export TMUX="/tmp/fake,0,0"
+NOTIFY_SET_TITLE=1 run_notify bash "$NOTIFY" title <<<'{"cwd":"/x/myproj"}'
+unset TMUX
+assert_contains "$(mock_args tmux)" "select-pane -T myproj" "tmux pane title set to the project basename"
+teardown
+
+test_case "title hook sets the iTerm2 session name when opted in and not in tmux"
+setup
+unset TMUX 2>/dev/null || true
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'case "$* $__stdin" in *"is running"*) echo true ;; *) echo "" ;; esac'
+NOTIFY_SET_TITLE=1 run_notify bash "$NOTIFY" title <<<'{"cwd":"/x/myproj"}'
+assert_contains "$(mock_stdin osascript)" 'set name of s to "myproj"' "iTerm2 session name set to the project basename"
+teardown
+
+test_case "title hook escapes embedded double quotes for AppleScript"
+setup
+unset TMUX 2>/dev/null || true
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'case "$* $__stdin" in *"is running"*) echo true ;; *) echo "" ;; esac'
+NOTIFY_SET_TITLE=1 run_notify bash "$NOTIFY" title <<<'{"cwd":"/x/we\"ird"}'
+assert_contains "$(mock_stdin osascript)" 'set name of s to "we\"ird"' "embedded quote is escaped, not breaking the AppleScript string"
+teardown
+
+test_case "title hook does nothing if iTerm2 isn't running (never launches it)"
+setup
+unset TMUX 2>/dev/null || true
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock osascript 'echo false'
+mock terminal-notifier 'true'
+NOTIFY_SET_TITLE=1 run_notify bash "$NOTIFY" title <<<'{"cwd":"/x/myproj"}'
+assert_not_contains "$(mock_stdin osascript)" "set name" "no attempt to set a name when iTerm2 isn't running"
+assert_eq 0 "$(mock_calls terminal-notifier)" "still no notification fired"
+teardown
+
 # ── --report: summarize the event log ──────────────────────────────
 test_case "--report summarizes outcomes, types, and clicks"
 setup

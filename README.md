@@ -89,6 +89,7 @@ Claude Code hook fires
 | `Stop` | — | Claude finished responding |
 | `Notification` | `permission_prompt` | Claude needs tool approval |
 | `Notification` | `elicitation_dialog` | Claude is asking a question |
+| `SessionStart` | — | A session starts/resumes (title-setting, opt-in — see below) |
 
 ## tmux & OMC
 
@@ -96,6 +97,12 @@ If Claude runs inside a tmux session (as [oh-my-claudecode](https://github.com/Y
 
 Sessions with **no attached tab** — OMC background workers/subagents, or stale runs you've moved on from — are intentionally **not** notified on `stop`: there is no tab to take you to, and an active run always has its tab. This keeps "done" notifications tied to things you can actually click into, and avoids spawning or hijacking tabs.
 Permission and Question prompts are the exception: a tab-less worker blocked on one is genuinely stuck waiting on you, so it still notifies — just without a click target, since there's no client tab to focus.
+
+## Tab Titles (opt-in)
+
+The notification **subtitle** is "what Claude was doing" — the iTerm2 session name or tmux pane title. When a tab still has its shell default (an unnamed tab, plain `zsh`), the subtitle is empty or useless. Set `NOTIFY_SET_TITLE=1` in the environment Claude Code runs in to have a `SessionStart` hook set the tab title to the project name (`basename "$cwd"`) directly — via `tmux select-pane -T` inside tmux, or the iTerm2 session name otherwise.
+
+This is off by default. Claude Code's `sessionTitle` hook output exists but its effect on the actual terminal/tmux title is undocumented (it may be purely internal to Claude Code's own UI), so this doesn't depend on it — it sets the terminal title itself, directly. And there's no reliable way to tell "this tab still has its default title" from "the user deliberately named this tab" apart, so rather than guess, the opt-in itself is the safety net: once enabled, every `SessionStart` unconditionally (re)sets the title to the project name, including tabs you named yourself.
 
 `tmux` is found even from terminal-notifier's minimal-PATH click callback (the script prepends Homebrew's bin).
 
@@ -164,6 +171,7 @@ The hook script lives at `~/.claude/hooks/notify.sh`. Behavior is tunable via en
 | `NOTIFY_HOLD_MAX_SECONDS` | `600` | Heartbeat interval for long-busy sessions (also max hold before the first "Still working" ping); `0` disables idle-gating |
 | `NOTIFY_HOLD_POLL_SECONDS` | `10` | How often a held stop re-checks the tab title |
 | `NOTIFY_AGENT_STOPS=1` | unset | Also notify when agent-team worker sessions stop |
+| `NOTIFY_SET_TITLE=1` | unset | Set the tab title to the project name on `SessionStart` (see Tab Titles above) |
 | `NOTIFY_DEBUG=1` | unset | Write a decision trace to `/tmp/claude-iterm-notification-*.log` |
 
 Other tweaks:
@@ -182,7 +190,7 @@ A dependency-free test suite (pure bash, no `bats`) lives in `tests/`. It runs `
 
 (The harness sets `NOTIFY_TEST=1` so `notify.sh` skips its Homebrew PATH prepend and the mock tools on `PATH` take effect.)
 
-Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip on stop, still notify on permission/question / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing at its 20-min default, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), stale-notification retraction and its `retract` event / "Retracted:" report line, event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
+Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip on stop, still notify on permission/question / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing at its 20-min default, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), stale-notification retraction and its `retract` event / "Retracted:" report line, the opt-in `SessionStart` title hook (tmux + iTerm2, AppleScript-string escaping, never launches iTerm2), event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
 
 ## Files
 

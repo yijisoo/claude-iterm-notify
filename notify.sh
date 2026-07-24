@@ -101,6 +101,16 @@ iterm_running() {
 # Escape a string for embedding inside single quotes in a shell command.
 sq_escape() { printf '%s' "${1//\'/\'\\\'\'}"; }
 
+# Escape a string for embedding inside a double-quoted AppleScript string
+# literal. Needed only for values that aren't shape-constrained the way a
+# tty/session name is — a directory basename can contain anything.
+as_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
 # ── AppleScript: select the iTerm2 tab whose session has the given tty ──
 # Returns "yes" on success, "no" if no matching tty is currently visible.
 focus_iterm_tty() {
@@ -444,6 +454,49 @@ import sys, json
 print(json.load(sys.stdin).get('cwd', ''))
 " <<< "$PAYLOAD" 2>/dev/null || echo "")
 PROJECT=$(basename "${CWD:-unknown}")
+
+# ── SessionStart: set the tab title from the project name (opt-in) ──
+# sessionTitle's actual effect on the real terminal is undocumented (may be
+# internal to Claude Code's own UI only), so this doesn't depend on it at
+# all — it sets the tmux pane title / iTerm2 session name directly via
+# well-documented primitives. Off by default (NOTIFY_SET_TITLE=1 to enable):
+# this is the one place the script WRITES terminal/tmux state instead of
+# just reading it, and there's no reliable way to tell "default title" from
+# "user renamed this tab" apart, so opt-in is the safety net, not a guess.
+if [ "$HOOK_TYPE" = "title" ]; then
+  if [ "${NOTIFY_SET_TITLE:-}" = "1" ]; then
+    if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+      # Runs synchronously inside the real session, so it inherits its
+      # actual TMUX env — the current pane needs no lookup, unlike --focus
+      # which runs later from a disconnected process tree.
+      tmux select-pane -T "$PROJECT" >/dev/null 2>&1 || true
+      log "title: set tmux pane title to $PROJECT"
+    elif iterm_running; then
+      RAW_TTY=$(get_tty)
+      if [ -n "$RAW_TTY" ]; then
+        osa 2>/dev/null <<EOF || true
+tell application "iTerm2"
+  repeat with w in windows
+    try
+      repeat with t in tabs of w
+        try
+          repeat with s in sessions of t
+            try
+              if tty of s is "$RAW_TTY" then set name of s to "$(as_escape "$PROJECT")"
+            end try
+          end repeat
+        end try
+      end repeat
+    end try
+  end repeat
+end tell
+EOF
+        log "title: set iTerm2 session name to $PROJECT"
+      fi
+    fi
+  fi
+  exit 0
+fi
 
 case "$HOOK_TYPE" in
   stop)

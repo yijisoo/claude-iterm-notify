@@ -79,6 +79,14 @@ notify_hooks = {
                 "command": "~/.claude/hooks/notify.sh question"
             }]
         }
+    ],
+    "SessionStart": [
+        {
+            "hooks": [{
+                "type": "command",
+                "command": "~/.claude/hooks/notify.sh title"
+            }]
+        }
     ]
 }
 
