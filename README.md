@@ -126,6 +126,7 @@ The event log below doubles as the canary: if mid-work deliveries reappear after
 **Retracting stale notifications.**
 Every notification is tagged with a `-group` id derived from the session's durable identity (tmux session name, or tty), and every hook invocation opens by checking whether that session already has one outstanding — if so, it's removed from Notification Center via `terminal-notifier -remove` before anything else happens, regardless of whether this new event goes on to show a fresh one.
 This matters most for the case a same-session *replacement* notification doesn't cover: you resolve a permission prompt or a question directly at the terminal (not by clicking the notification), and the session goes on to do more work without immediately producing another notification (idle-gating holds it, or the next stop gets debounced) — the outdated banner would otherwise sit in Notification Center until whenever the next delivery happens to occur. Now it's cleared the moment the session shows any sign of life.
+Each retraction is logged as its own `retract` event, so `--report`'s "Retracted: N" line tells you how often this is actually saving you from a stale click.
 
 **Debounce vs. cycling loop sessions.**
 There is no reliable signal for "this pause is the loop's final stop" vs. "this pause is between iterations" — loop modes (ralph/autopilot/standup-autopilot) idle and resume on their own schedule regardless of whether you act on a notification, often every few minutes.
@@ -181,7 +182,7 @@ A dependency-free test suite (pure bash, no `bats`) lives in `tests/`. It runs `
 
 (The harness sets `NOTIFY_TEST=1` so `notify.sh` skips its Homebrew PATH prepend and the mock tools on `PATH` take effect.)
 
-Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip on stop, still notify on permission/question / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing at its 20-min default, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), stale-notification retraction, event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
+Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip on stop, still notify on permission/question / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing at its 20-min default, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), stale-notification retraction and its `retract` event / "Retracted:" report line, event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
 
 ## Files
 

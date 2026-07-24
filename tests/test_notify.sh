@@ -420,6 +420,8 @@ run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 tn="$(mock_args terminal-notifier)"
 assert_eq 2 "$(mock_calls terminal-notifier)" "resumed activity triggers a synchronous -remove, no second send yet"
 assert_contains "$tn" "-remove claude-sessR" "the earlier notification is retracted by its group id"
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\tretract\tyes\tp\tsessR' \
+  "the retraction is logged as its own event, distinct from held/notified/debounced"
 teardown
 
 test_case "a session's first-ever event never attempts a removal (nothing was live)"
@@ -430,6 +432,7 @@ mock osascript 'echo Finder'
 mock terminal-notifier 'true'
 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 assert_not_contains "$(mock_args terminal-notifier)" "-remove" "nothing to retract on a session's first event"
+assert_not_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\tretract\t' "no retract event logged either"
 teardown
 
 test_case "a debounced repeat still clears the stale notification from the first"
@@ -627,6 +630,8 @@ now=$(date +%Y-%m-%dT%H:%M:%S)
   printf '%s\tpermission\tnotified\tprojB\tsess2\ttty:/dev/ttys2\tallow?\n' "$now"
   printf '%s\tstop\tskip_no_tab\tprojB\tworker1\t-\tw\n' "$now"
   printf '%s\tclick\tyes\t-\t-\ttty:/dev/ttys1\t-\n' "$now"
+  printf '%s\tretract\tyes\tprojA\tsess1\tclaude-sess1\tt\n' "$now"
+  printf '%s\tretract\tyes\tprojA\tsess1\tclaude-sess1\tt\n' "$now"
 } > "$SANDBOX/events.tsv"
 out=$(run_notify bash "$NOTIFY" --report </dev/null)
 assert_contains "$out" "delivered 3" "counts delivered notifications"
@@ -635,6 +640,9 @@ assert_contains "$out" "1 permission" "delivered-by-type: permission"
 assert_contains "$out" "1 skip_no_tab" "suppressed outcomes included"
 assert_contains "$out" "Click-through: 1 of 3" "click-through rate"
 assert_contains "$out" "Bursts: 2" "counts rapid-fire delivered notifications"
+assert_contains "$out" "Retracted: 2" "counts stale notifications cleared before they were seen"
+assert_not_contains "$(echo "$out" | sed -n '/^Outcomes:/,/^$/p')" "yes" \
+  "retract's 'yes' outcome doesn't pollute the generic Outcomes tally (same treatment as click)"
 teardown
 
 test_case "--report without a log explains itself"

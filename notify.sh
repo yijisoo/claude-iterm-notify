@@ -36,8 +36,10 @@ fi
 # ── Event log: one TSV line per decision, for reviewing notification noise ──
 # Always on (cheap, local, size-capped). Fields:
 #   timestamp  event  outcome  project  session  target  detail
-#   event   = hook type (stop|permission|question) or click (--focus callback)
-#   outcome = notified|skip_no_tab|skip_watching|debounced, or yes|no for click
+#   event   = hook type (stop|permission|question), click (--focus callback),
+#             or retract (a stale notification was cleared before delivery)
+#   outcome = notified|held|heartbeat|skip_no_tab|skip_watching|
+#             skip_agent_worker|debounced, or yes/no for click, or yes for retract
 # Review with `notify.sh --report [days]`. Disable with NOTIFY_EVENT_LOG=0.
 EVENT_LOG="${NOTIFY_EVENT_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-iterm-notify/events.tsv}"
 EVENT_LOG_MAX_BYTES=524288   # ~weeks of events; one .old generation kept
@@ -164,14 +166,15 @@ if [ "${1:-}" = "--report" ]; then
   TOTAL=$(wc -l < "$WINDOW" | tr -d ' ')
   DELIVERED=$(awk -F'\t' '$3 == "notified"' "$WINDOW" | wc -l | tr -d ' ')
   CLICKS=$(awk -F'\t' '$2 == "click"' "$WINDOW" | wc -l | tr -d ' ')
+  RETRACTED=$(awk -F'\t' '$2 == "retract"' "$WINDOW" | wc -l | tr -d ' ')
 
   echo "claude-iterm-notify — last $DAYS day(s)"
   echo "log: $EVENT_LOG"
   echo
-  echo "Events: $TOTAL   (delivered $DELIVERED, clicks $CLICKS)"
+  echo "Events: $TOTAL   (delivered $DELIVERED, clicks $CLICKS, retracted $RETRACTED)"
   echo
   echo "Outcomes:"
-  awk -F'\t' '$2 != "click" { print $3 }' "$WINDOW" | sort | uniq -c | sort -rn || true
+  awk -F'\t' '$2 != "click" && $2 != "retract" { print $3 }' "$WINDOW" | sort | uniq -c | sort -rn || true
   echo
   echo "Delivered by type:"
   awk -F'\t' '$3 == "notified" { print $2 }' "$WINDOW" | sort | uniq -c | sort -rn || true
@@ -199,6 +202,7 @@ if [ "${1:-}" = "--report" ]; then
     echo "Click-through: $CLICKS of $DELIVERED delivered ($((100 * CLICKS / DELIVERED))%)"
   fi
   echo "Bursts: $BURSTS delivered within 60s of the previous delivered notification"
+  echo "Retracted: $RETRACTED stale notifications cleared before you could click a now-outdated one"
   exit 0
 fi
 
@@ -280,6 +284,7 @@ clear_stale_notification() {
   rm -f "$marker" 2>/dev/null || true
   terminal-notifier -remove "$(notify_group)" >/dev/null 2>&1 || true
   log "cleared stale notification group=$(notify_group) (new activity on this session)"
+  event_log retract yes "$PROJECT" "$key_in" "$(notify_group)" "$DETAIL"
   return 0
 }
 
