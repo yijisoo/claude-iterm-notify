@@ -257,6 +257,280 @@ else
 fi
 teardown
 
+# ── Event log: every decision leaves one reviewable TSV line ───────
+# Fields: ts, event, outcome, project, session, target, detail.
+test_case "delivered stop appends a 'notified' event line"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tomc-sess\tthe task title\n" ;;
+  list-clients) printf "/dev/ttys8\tomc-sess\n" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/proj","stop_hook_active":false}'
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" \
+  $'\tstop\tnotified\tproj\tomc-sess\ttty:/dev/ttys8\tthe task title' \
+  "logs event, outcome, project, session, target, subtitle"
+teardown
+
+test_case "tab-less skip is logged as skip_no_tab with the session name"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tomc-worker\twork\n" ;;
+  list-clients) : ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/proj","stop_hook_active":false}'
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" \
+  $'\tstop\tskip_no_tab\tproj\tomc-worker\t-\twork' \
+  "suppressed worker session is recorded, not lost"
+teardown
+
+test_case "debounced stop is logged as debounced"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tsessD\tt\n" ;; list-clients) printf "/dev/ttys8\tsessD\n" ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+elog="$(cat "$SANDBOX/events.tsv" 2>/dev/null)"
+assert_contains "$elog" $'\tstop\tnotified\tp\tsessD' "first stop logged as notified"
+assert_contains "$elog" $'\tstop\tdebounced\tp\tsessD' "second stop logged as debounced"
+teardown
+
+test_case "watching suppression is logged as skip_watching"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'true'
+mock osascript 'case "$* $__stdin" in
+  *"is running"*) echo true ;;
+  *frontmost*) echo iTerm2 ;;
+  *"current session of current window"*) echo /dev/ttys9 ;;
+  *) echo myterm ;;
+esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" \
+  $'\tstop\tskip_watching\tp\t/dev/ttys9' "watched-tab suppression is recorded"
+teardown
+
+test_case "notification click is logged from the --focus callback"
+setup
+mock osascript 'echo yes'
+run_notify bash "$NOTIFY" --focus 'tty:/dev/ttys5' </dev/null
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" \
+  $'\tclick\tyes\t-\t-\ttty:/dev/ttys5\t-' "click and focus result recorded"
+teardown
+
+test_case "NOTIFY_EVENT_LOG=0 disables event logging"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tsessL\tt\n" ;; list-clients) printf "/dev/ttys8\tsessL\n" ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+NOTIFY_EVENT_LOG=0 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_eq 1 "$(mock_calls terminal-notifier)" "still notifies with logging off"
+if [ ! -e "$SANDBOX/events.tsv" ] && [ ! -e "0" ]; then
+  pass "no event log written"
+else
+  fail "event log written despite NOTIFY_EVENT_LOG=0"
+fi
+teardown
+
+test_case "unwritable event log never breaks the hook"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tsessU\tt\n" ;; list-clients) printf "/dev/ttys8\tsessU\n" ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+mkdir -p "$SANDBOX/ro" && chmod 500 "$SANDBOX/ro"
+if NOTIFY_EVENT_LOG="$SANDBOX/ro/sub/events.tsv" \
+   run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'; then
+  pass "hook exits 0 despite unwritable log path"
+else
+  fail "hook aborted (rc=$?) on unwritable log path"
+fi
+assert_eq 1 "$(mock_calls terminal-notifier)" "notification still sent"
+chmod 700 "$SANDBOX/ro"
+teardown
+
+test_case "oversized event log rotates to .old"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in list-panes) printf "/dev/ttys9\tsessR\tt\n" ;; list-clients) printf "/dev/ttys8\tsessR\n" ;; esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+dd if=/dev/zero of="$SANDBOX/events.tsv" bs=1024 count=600 2>/dev/null
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+if [ -f "$SANDBOX/events.tsv.old" ]; then pass "old log rotated aside"; else fail "no .old rotation"; fi
+assert_eq 1 "$(wc -l < "$SANDBOX/events.tsv" | tr -d ' ')" "fresh log holds just the new event"
+teardown
+
+# ── Worker sessions (claude --agent-id): stops off, asks on ────────
+test_case "stop from an agent-team worker session is suppressed"
+setup
+mock ps 'case "$*" in
+  *"-o tty="*) echo ttys9 ;;
+  *"-o ppid="*) echo 1 ;;
+  *"-o command="*) echo "claude --agent-id explore-1@session-2" ;;
+esac'
+mock tmux 'true'
+mock osascript 'case "$* $__stdin" in *"is running"*) echo true ;; *frontmost*) echo Finder ;; *) echo myterm ;; esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/proj","stop_hook_active":false}'
+assert_eq 0 "$(mock_calls terminal-notifier)" "worker stop not notified"
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" \
+  $'\tstop\tskip_agent_worker\tproj' "suppression recorded in the event log"
+teardown
+
+test_case "permission prompt from a worker session still notifies"
+setup
+mock ps 'case "$*" in
+  *"-o tty="*) echo ttys9 ;;
+  *"-o ppid="*) echo 1 ;;
+  *"-o command="*) echo "claude --agent-id explore-1@session-2" ;;
+esac'
+mock tmux 'true'
+mock osascript 'case "$* $__stdin" in *"is running"*) echo true ;; *frontmost*) echo Finder ;; *) echo myterm ;; esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" permission <<<'{"cwd":"/x/proj","message":"allow?"}'
+assert_eq 1 "$(mock_calls terminal-notifier)" "worker permission prompt delivered"
+teardown
+
+# ── Idle-gating: mid-work stops wait for the tab title to go idle ──
+test_case "stop with a working-spinner title is held, then delivered on idle"
+setup
+printf '⠐ deep task (bun)' > "$SANDBOX/title"
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tsessG\t%s\n" "$(cat '"$SANDBOX"'/title)" ;;
+  list-clients) printf "/dev/ttys8\tsessG\n" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_eq 0 "$(mock_calls terminal-notifier)" "not delivered while the spinner shows"
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\tstop\theld\tp\tsessG' "hold recorded"
+printf '✳ deep task (bun)' > "$SANDBOX/title"
+sleep 2.5
+assert_eq 1 "$(mock_calls terminal-notifier)" "delivered once the title went idle"
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\tstop\tnotified\tp\tsessG' "delivery recorded"
+teardown
+
+test_case "stop with an idle title delivers immediately (no hold)"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'true'
+mock osascript 'case "$* $__stdin" in
+  *"is running"*) echo true ;;
+  *frontmost*) echo Finder ;;
+  *"name of s"*) echo "✳ myterm" ;;
+  *) echo "" ;;
+esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_eq 1 "$(mock_calls terminal-notifier)" "idle session notifies without delay"
+assert_not_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\theld\t' "no hold recorded"
+teardown
+
+test_case "only the newest of two held stops delivers"
+setup
+printf '⠂ busy (bun)' > "$SANDBOX/title"
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tsessS\t%s\n" "$(cat '"$SANDBOX"'/title)" ;;
+  list-clients) printf "/dev/ttys8\tsessS\n" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+printf '✳ busy (bun)' > "$SANDBOX/title"
+sleep 2.5
+assert_eq 1 "$(mock_calls terminal-notifier)" "burst collapses to a single delivery"
+teardown
+
+test_case "a held stop delivers at the cap even if the spinner never clears"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tsessC\t⠐ forever (bun)\n" ;;
+  list-clients) printf "/dev/ttys8\tsessC\n" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+NOTIFY_HOLD_MAX_SECONDS=2 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+sleep 3.5
+assert_eq 1 "$(mock_calls terminal-notifier)" "cap forces delivery — never silence"
+teardown
+
+test_case "NOTIFY_HOLD_MAX_SECONDS=0 disables idle-gating"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tsessO\t⠐ busy (bun)\n" ;;
+  list-clients) printf "/dev/ttys8\tsessO\n" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+NOTIFY_HOLD_MAX_SECONDS=0 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_eq 1 "$(mock_calls terminal-notifier)" "gating off notifies immediately"
+assert_not_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\theld\t' "no hold recorded"
+teardown
+
+test_case "delivery re-checks watching: no ping if you got there first"
+setup
+printf '⠐ busy (bun)' > "$SANDBOX/title"
+printf 'Finder' > "$SANDBOX/front"
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'true'
+mock osascript 'case "$* $__stdin" in
+  *"is running"*) echo true ;;
+  *frontmost*) cat '"$SANDBOX"'/front ;;
+  *"current session of current window"*) echo /dev/ttys9 ;;
+  *"name of s"*) cat '"$SANDBOX"'/title ;;
+  *) echo "" ;;
+esac'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\theld\t' "held while working"
+printf 'iTerm2' > "$SANDBOX/front"
+printf '✳ busy (bun)' > "$SANDBOX/title"
+sleep 2.5
+assert_eq 0 "$(mock_calls terminal-notifier)" "watched tab not pinged at delivery time"
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\tskip_watching\t' "late suppression recorded"
+teardown
+
+# ── --report: summarize the event log ──────────────────────────────
+test_case "--report summarizes outcomes, types, and clicks"
+setup
+now=$(date +%Y-%m-%dT%H:%M:%S)
+{
+  printf '%s\tstop\tnotified\tprojA\tsess1\ttty:/dev/ttys1\tt\n' "$now"
+  printf '%s\tstop\tnotified\tprojA\tsess1\ttty:/dev/ttys1\tt\n' "$now"
+  printf '%s\tpermission\tnotified\tprojB\tsess2\ttty:/dev/ttys2\tallow?\n' "$now"
+  printf '%s\tstop\tskip_no_tab\tprojB\tworker1\t-\tw\n' "$now"
+  printf '%s\tclick\tyes\t-\t-\ttty:/dev/ttys1\t-\n' "$now"
+} > "$SANDBOX/events.tsv"
+out=$(run_notify bash "$NOTIFY" --report </dev/null)
+assert_contains "$out" "delivered 3" "counts delivered notifications"
+assert_contains "$out" "2 stop" "delivered-by-type: stop"
+assert_contains "$out" "1 permission" "delivered-by-type: permission"
+assert_contains "$out" "1 skip_no_tab" "suppressed outcomes included"
+assert_contains "$out" "Click-through: 1 of 3" "click-through rate"
+assert_contains "$out" "Bursts: 2" "counts rapid-fire delivered notifications"
+teardown
+
+test_case "--report without a log explains itself"
+setup
+out=$(run_notify bash "$NOTIFY" --report </dev/null)
+assert_contains "$out" "No event log" "empty state is explained, not an error"
+teardown
+
 # ── terminal-notifier chatter must not leak to stdout ──────────────
 test_case "terminal-notifier output is not surfaced as hook output"
 setup

@@ -90,6 +90,20 @@ assert_eq 0 "$(count_hook '.claude/hooks/notify.sh')" "this tool's hooks removed
 assert_eq 1 "$(count_hook 'other/notify.sh')" "unrelated notify.sh kept (tightened match)"
 teardown
 
+# ── uninstall removes the collected event log ──────────────────────
+test_case "uninstall removes the event-log state dir"
+setup; prepare_home
+run_install
+mkdir -p "$SANDBOX/home/.local/state/claude-iterm-notify"
+touch "$SANDBOX/home/.local/state/claude-iterm-notify/events.tsv"
+run_uninstall
+if [ ! -d "$SANDBOX/home/.local/state/claude-iterm-notify" ]; then
+  pass "event-log state dir removed"
+else
+  fail "event-log state dir left behind"
+fi
+teardown
+
 # ── uninstall is safe with no tty on stdin ─────────────────────────
 test_case "uninstall completes when stdin is not a tty (piped)"
 setup; prepare_home

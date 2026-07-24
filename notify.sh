@@ -33,6 +33,40 @@ else
   log() { :; }
 fi
 
+# ── Event log: one TSV line per decision, for reviewing notification noise ──
+# Always on (cheap, local, size-capped). Fields:
+#   timestamp  event  outcome  project  session  target  detail
+#   event   = hook type (stop|permission|question) or click (--focus callback)
+#   outcome = notified|skip_no_tab|skip_watching|debounced, or yes|no for click
+# Review with `notify.sh --report [days]`. Disable with NOTIFY_EVENT_LOG=0.
+EVENT_LOG="${NOTIFY_EVENT_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-iterm-notify/events.tsv}"
+EVENT_LOG_MAX_BYTES=524288   # ~weeks of events; one .old generation kept
+
+# Collapse tabs/newlines and cap length so every event stays one TSV line.
+clean_field() {
+  local s="${1:--}"
+  s="${s//$'\t'/ }"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"
+  printf '%s' "${s:0:160}"
+}
+
+# event_log <event> <outcome> <project> <session> <target> <detail>
+# Must never fail or block the hook, whatever the filesystem does.
+event_log() {
+  if [ "$EVENT_LOG" = "0" ]; then return 0; fi
+  mkdir -p "$(dirname "$EVENT_LOG")" 2>/dev/null || return 0
+  local size
+  size=$(stat -f %z "$EVENT_LOG" 2>/dev/null || echo 0)
+  if [ "$size" -gt "$EVENT_LOG_MAX_BYTES" ] 2>/dev/null; then
+    mv -f "$EVENT_LOG" "$EVENT_LOG.old" 2>/dev/null || true
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S)" \
+    "$(clean_field "$1")" "$(clean_field "$2")" "$(clean_field "$3")" \
+    "$(clean_field "$4")" "$(clean_field "$5")" "$(clean_field "$6")" \
+    >> "$EVENT_LOG" 2>/dev/null || true
+  return 0
+}
+
 # ── osascript wrapper with a timeout ───────────────────────────────
 # An unresponsive/modal iTerm2 can make osascript hang indefinitely, which
 # would stall this hook (Claude Code may kill a slow hook). Bound it with
@@ -102,10 +136,69 @@ if [ "${1:-}" = "--focus" ]; then
   case "$TARGET" in
     tty:*)
       TTY_PATH="${TARGET#tty:}"
-      log "--focus: tty $TTY_PATH -> $(focus_iterm_tty "$TTY_PATH")"
+      FOCUS_RESULT=$(focus_iterm_tty "$TTY_PATH")
+      log "--focus: tty $TTY_PATH -> $FOCUS_RESULT"
+      event_log click "$FOCUS_RESULT" - - "$TARGET" -
       ;;
     *) log "--focus: nothing to do (target=$TARGET)" ;;
   esac
+  exit 0
+fi
+
+# ── Summarize the event log ────────────────────────────────────────
+# Must stay above the `PAYLOAD=$(cat)` hook flow: --report runs from a
+# terminal with no piped stdin and must not block waiting for it.
+if [ "${1:-}" = "--report" ]; then
+  DAYS="${2:-7}"
+  if [ ! -f "$EVENT_LOG" ] && [ ! -f "$EVENT_LOG.old" ]; then
+    echo "No event log at $EVENT_LOG yet — it fills as Claude Code hooks fire."
+    exit 0
+  fi
+  # ISO timestamps compare lexicographically; an empty cutoff includes all.
+  CUTOFF=$(date -v"-${DAYS}d" +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo "")
+  WINDOW=$(mktemp)
+  trap 'rm -f "$WINDOW"' EXIT
+  cat "$EVENT_LOG.old" "$EVENT_LOG" 2>/dev/null \
+    | awk -F'\t' -v c="$CUTOFF" 'c == "" || $1 >= c' > "$WINDOW" || true
+
+  TOTAL=$(wc -l < "$WINDOW" | tr -d ' ')
+  DELIVERED=$(awk -F'\t' '$3 == "notified"' "$WINDOW" | wc -l | tr -d ' ')
+  CLICKS=$(awk -F'\t' '$2 == "click"' "$WINDOW" | wc -l | tr -d ' ')
+
+  echo "claude-iterm-notify — last $DAYS day(s)"
+  echo "log: $EVENT_LOG"
+  echo
+  echo "Events: $TOTAL   (delivered $DELIVERED, clicks $CLICKS)"
+  echo
+  echo "Outcomes:"
+  awk -F'\t' '$2 != "click" { print $3 }' "$WINDOW" | sort | uniq -c | sort -rn || true
+  echo
+  echo "Delivered by type:"
+  awk -F'\t' '$3 == "notified" { print $2 }' "$WINDOW" | sort | uniq -c | sort -rn || true
+  echo
+  echo "Delivered by project:"
+  awk -F'\t' '$3 == "notified" { print $4 }' "$WINDOW" | sort | uniq -c | sort -rn | head -10 || true
+  echo
+  echo "Noisiest sessions (delivered):"
+  awk -F'\t' '$3 == "notified" { print $4 " / " $5 }' "$WINDOW" | sort | uniq -c | sort -rn | head -10 || true
+  echo
+  echo "Suppressed tab-less sessions (top):"
+  awk -F'\t' '$3 == "skip_no_tab" { print $4 " / " $5 }' "$WINDOW" | sort | uniq -c | sort -rn | head -10 || true
+  echo
+  # Burst = a delivered notification landing <=60s after the previous one
+  # (any session) — the "many parallel sessions ping at once" pressure.
+  # Day-seconds comparison; bursts spanning midnight are not counted.
+  BURSTS=$(awk -F'\t' '$3 == "notified" {
+      d = substr($1, 1, 10)
+      split(substr($1, 12), a, ":")
+      s = a[1]*3600 + a[2]*60 + a[3]
+      if (d == pd && s >= ps && s - ps <= 60) n++
+      pd = d; ps = s
+    } END { print n + 0 }' "$WINDOW")
+  if [ "$DELIVERED" -gt 0 ]; then
+    echo "Click-through: $CLICKS of $DELIVERED delivered ($((100 * CLICKS / DELIVERED))%)"
+  fi
+  echo "Bursts: $BURSTS delivered within 60s of the previous delivered notification"
   exit 0
 fi
 
@@ -137,10 +230,20 @@ EOF
 # the session being reattached to a different tab.
 DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-180}"
 DEBOUNCE_DIR="${NOTIFY_DEBOUNCE_DIR:-/tmp/claude-iterm-notify-debounce}"
+
+# Filesystem-safe stamp name for a session key (shared by debounce + hold).
+hash_key() {
+  local key
+  key=$(printf '%s' "$1" | shasum 2>/dev/null | cut -c1-40)
+  if [ -z "$key" ]; then
+    key=$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_')
+  fi
+  printf '%s' "$key"
+}
+
 debounce_ok() {
   local key_in="$1" key stamp now mtime
-  key=$(printf '%s' "$key_in" | shasum 2>/dev/null | cut -c1-40)
-  [ -z "$key" ] && key=$(printf '%s' "$key_in" | tr -c 'a-zA-Z0-9' '_')
+  key=$(hash_key "$key_in")
   mkdir -p "$DEBOUNCE_DIR"
   # Opportunistically reap old stamps so they don't accumulate indefinitely.
   find "$DEBOUNCE_DIR" -type f -mtime +1 -delete 2>/dev/null || true
@@ -167,17 +270,85 @@ get_tty() {
   done
 }
 
+# ── Is this hook running under a spawned agent-team worker? ────────
+# Worker sessions are launched as `claude --agent-id <agent>@<session>`;
+# sessions the user drives carry no such flag. Positive match only: if a
+# future Claude Code renames the flag, workers simply notify again
+# (today's behavior) instead of anything going silent.
+is_agent_worker() {
+  local pid=$$ cmd depth=0
+  # Depth cap: a real ancestry ends at pid 1, but never trust ps output
+  # (or a test mock) to guarantee progress toward it.
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$depth" -lt 25 ]; do
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    case "$cmd" in
+      *" --agent-id "*|*" --agent-id="*) return 0 ;;
+    esac
+    pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+# ── Working-spinner detection on a tab title ───────────────────────
+# Claude Code titles a working session with a braille-dot spinner frame
+# (any of U+2800-28FF) and an idle one with '✳'. We match the whole
+# braille block, and we hold ONLY on a positive spinner match: if the
+# title convention ever changes, the gate never engages and behavior
+# falls back to notify-immediately — late is possible, silence is not.
+has_spinner() {
+  printf '%s' "${1:-}" | /usr/bin/python3 -c '
+import sys
+text = sys.stdin.buffer.read().decode("utf-8", "replace")
+sys.exit(0 if any(0x2800 <= ord(c) <= 0x28FF for c in text) else 1)
+' 2>/dev/null
+}
+
+# ── Re-read the live title for the firing session's raw tty ────────
+# tmux pane title when the tty is a pane, else the iTerm2 session name.
+current_title() {
+  local raw_tty="$1" t
+  if command -v tmux >/dev/null 2>&1; then
+    t=$(tmux list-panes -a -F $'#{pane_tty}\t#{pane_title}' 2>/dev/null \
+      | awk -F'\t' -v t="$raw_tty" '$1 == t { sub(/^[^\t]*\t/, ""); print; exit }' || true)
+    if [ -n "$t" ]; then
+      printf '%s' "$t"
+      return 0
+    fi
+  fi
+  osa 2>/dev/null <<EOF || true
+tell application "iTerm2"
+  repeat with w in windows
+    try
+      repeat with t in tabs of w
+        try
+          repeat with s in sessions of t
+            try
+              if tty of s is "$raw_tty" then
+                return name of s
+              end if
+            end try
+          end repeat
+        end try
+      end repeat
+    end try
+  end repeat
+end tell
+EOF
+}
+
 # ── Resolve the iTerm2 tab for the firing session ──────────────────
-# Echoes three lines: TARGET, SUBTITLE, DEBOUNCE_KEY.
+# Echoes four lines: TARGET, SUBTITLE, DEBOUNCE_KEY, RAW_TTY.
 #   TARGET   = "tty:<iterm-tty>"  -> notify and focus that tab
 #            = "SKIP"             -> tmux session has no tab; do NOT notify
 #            = ""                 -> no controlling tty; notify, just raise iTerm
+#   RAW_TTY  = the firing process's own tty (for live title re-checks)
 resolve_tab() {
   local raw_tty
   raw_tty=$(get_tty)
   log "raw_tty=$raw_tty"
   if [ -z "$raw_tty" ]; then
-    printf '\n\n\n'
+    printf '\n\n\n\n'
     return
   fi
 
@@ -195,10 +366,11 @@ resolve_tab() {
         | awk -F'\t' -v s="$session" '$2 == s {print $1; exit}' || true)
       if [ -z "$client" ]; then
         log "tmux session '$session' has no attached tab -> skipping"
-        printf 'SKIP\n\n\n'
+        # Still surface title + session so the skip can be logged by name.
+        printf 'SKIP\n%s\n%s\n%s\n' "${title:-$session}" "$session" "$raw_tty"
         return
       fi
-      printf 'tty:%s\n%s\n%s\n' "$client" "${title:-$session}" "$session"
+      printf 'tty:%s\n%s\n%s\n%s\n' "$client" "${title:-$session}" "$session" "$raw_tty"
       return
     fi
   fi
@@ -228,7 +400,7 @@ end tell
 EOF
 )
   fi
-  printf 'tty:%s\n%s\n%s\n' "$raw_tty" "$name" "$raw_tty"
+  printf 'tty:%s\n%s\n%s\n%s\n' "$raw_tty" "$name" "$raw_tty" "$raw_tty"
 }
 
 # ── Notification flow ──────────────────────────────────────────────
@@ -269,42 +441,97 @@ print(str(m)[:200])
     ;;
 esac
 
-{ IFS= read -r TARGET; IFS= read -r SUBTITLE; IFS= read -r DEBOUNCE_KEY; } < <(resolve_tab)
-log "TARGET=$TARGET SUBTITLE=$SUBTITLE DEBOUNCE_KEY=$DEBOUNCE_KEY"
+{ IFS= read -r TARGET; IFS= read -r SUBTITLE; IFS= read -r DEBOUNCE_KEY; IFS= read -r RAW_TTY; } < <(resolve_tab)
+log "TARGET=$TARGET SUBTITLE=$SUBTITLE DEBOUNCE_KEY=$DEBOUNCE_KEY RAW_TTY=$RAW_TTY"
+
+# Event-log detail: what the session was doing (stop) or what it asked (rest).
+if [ "$HOOK_TYPE" = "stop" ]; then DETAIL="$SUBTITLE"; else DETAIL="$MSG"; fi
 
 # Tab-less tmux session (worker/subagent/stale run) -> do not notify at all.
 if [ "$TARGET" = "SKIP" ]; then
+  event_log "$HOOK_TYPE" skip_no_tab "$PROJECT" "$DEBOUNCE_KEY" - "$DETAIL"
   exit 0
 fi
 
 ITERM_TTY="${TARGET#tty:}"   # the tab's tty (empty if TARGET is empty)
 
-# Skip redundant notifications when the user is already viewing this tab.
-if [ "${NOTIFY_ALWAYS:-}" != "1" ] && user_is_watching "$ITERM_TTY"; then
-  log "user is watching $ITERM_TTY — skipping notification"
+# Agent-team worker session: its "done" is the orchestrator's business, not
+# an attention request — suppress the stop. Permission/Question still notify
+# (a worker blocked on approval is stuck until the user acts).
+# NOTIFY_AGENT_STOPS=1 restores worker stop notifications.
+if [ "$HOOK_TYPE" = "stop" ] && [ "${NOTIFY_AGENT_STOPS:-}" != "1" ] && is_agent_worker; then
+  log "agent-team worker session — suppressing stop"
+  event_log "$HOOK_TYPE" skip_agent_worker "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
   exit 0
 fi
 
-# Debounce Stop notifications so OMC loop modes don't ping every iteration.
-# Permission/Question are explicit attention requests and are never debounced.
-if [ "$HOOK_TYPE" = "stop" ] && [ -n "$DEBOUNCE_KEY" ] && ! debounce_ok "$DEBOUNCE_KEY"; then
-  log "debounced (notified within ${DEBOUNCE_SECONDS}s) — skipping"
+# Deliver: watching re-check + debounce + send. Shared by the immediate path
+# and the idle-gate watcher, so a held delivery re-checks everything late.
+deliver_now() {
+  if [ "${NOTIFY_ALWAYS:-}" != "1" ] && user_is_watching "$ITERM_TTY"; then
+    log "user is watching $ITERM_TTY — skipping notification"
+    event_log "$HOOK_TYPE" skip_watching "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
+    return 0
+  fi
+  # Debounce Stop notifications so loop modes don't ping every iteration.
+  # Permission/Question are explicit attention requests, never debounced.
+  if [ "$HOOK_TYPE" = "stop" ] && [ -n "$DEBOUNCE_KEY" ] && ! debounce_ok "$DEBOUNCE_KEY"; then
+    log "debounced (notified within ${DEBOUNCE_SECONDS}s) — skipping"
+    event_log "$HOOK_TYPE" debounced "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
+    return 0
+  fi
+  local ARGS=(-title "$TITLE" -message "$MSG" -sound default)
+  if [ -n "$SUBTITLE" ]; then ARGS+=(-subtitle "$SUBTITLE"); fi
+  if [ -n "$TARGET" ]; then
+    ARGS+=(-group "claude-${DEBOUNCE_KEY:-$TARGET}")
+    ARGS+=(-execute "$HOME/.claude/hooks/notify.sh --focus '$(sq_escape "$TARGET")'")
+  else
+    ARGS+=(-activate com.googlecode.iterm2)
+  fi
+  log "terminal-notifier: title=$TITLE target=$TARGET"
+  # Silence terminal-notifier's "* Removing previously sent notification…"
+  # chatter on stdout (it replaces grouped notifications on every fire), which
+  # Claude Code would otherwise surface as spurious hook output.
+  terminal-notifier "${ARGS[@]}" >/dev/null 2>&1 || true
+  event_log "$HOOK_TYPE" notified "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
+  return 0
+}
+
+# Idle-gate mid-work stops: a stop whose tab title still shows the working
+# spinner is an intermediate turn end (e.g. subagents still running). Hold it
+# and deliver when the session actually goes idle. The newest stop for a
+# session owns the hold stamp, so a burst collapses into one notification at
+# the true end. The deadline guarantees a late delivery over a lost one.
+HOLD_MAX="${NOTIFY_HOLD_MAX_SECONDS:-600}"
+HOLD_POLL="${NOTIFY_HOLD_POLL_SECONDS:-10}"
+if [ "$HOOK_TYPE" = "stop" ] && [ "$HOLD_MAX" -gt 0 ] && [ -n "$RAW_TTY" ] \
+   && has_spinner "$SUBTITLE"; then
+  HOLD_STAMP="$DEBOUNCE_DIR/hold-$(hash_key "$DEBOUNCE_KEY")"
+  HOLD_TOKEN="$$.$(date +%s)"
+  mkdir -p "$DEBOUNCE_DIR" 2>/dev/null || true
+  printf '%s' "$HOLD_TOKEN" > "$HOLD_STAMP" 2>/dev/null || true
+  event_log "$HOOK_TYPE" held "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
+  log "held: spinner in title — waiting for idle (poll ${HOLD_POLL}s, max ${HOLD_MAX}s)"
+  (
+    DEADLINE=$(( $(date +%s) + HOLD_MAX ))
+    while :; do
+      sleep "$HOLD_POLL"
+      # Superseded by a newer stop for this session? Its watcher delivers.
+      [ "$(cat "$HOLD_STAMP" 2>/dev/null)" = "$HOLD_TOKEN" ] || exit 0
+      TITLE_NOW=$(current_title "$RAW_TTY")
+      if ! has_spinner "$TITLE_NOW" || [ "$(date +%s)" -ge "$DEADLINE" ]; then
+        rm -f "$HOLD_STAMP" 2>/dev/null || true
+        if [ -n "$TITLE_NOW" ]; then
+          SUBTITLE="$TITLE_NOW"
+          DETAIL="$TITLE_NOW"
+        fi
+        deliver_now
+        exit 0
+      fi
+    done
+  ) </dev/null >/dev/null 2>&1 &
   exit 0
 fi
 
-ARGS=(-title "$TITLE" -message "$MSG" -sound default)
-[ -n "$SUBTITLE" ] && ARGS+=(-subtitle "$SUBTITLE")
-
-if [ -n "$TARGET" ]; then
-  ARGS+=(-group "claude-${DEBOUNCE_KEY:-$TARGET}")
-  ARGS+=(-execute "$HOME/.claude/hooks/notify.sh --focus '$(sq_escape "$TARGET")'")
-else
-  ARGS+=(-activate com.googlecode.iterm2)
-fi
-
-log "terminal-notifier: title=$TITLE target=$TARGET"
-# Silence terminal-notifier's "* Removing previously sent notification…"
-# chatter on stdout (it replaces grouped notifications on every fire), which
-# Claude Code would otherwise surface as spurious hook output.
-terminal-notifier "${ARGS[@]}" >/dev/null 2>&1 || true
+deliver_now
 log "done"
