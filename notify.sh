@@ -467,7 +467,9 @@ fi
 
 # Deliver: watching re-check + debounce + send. Shared by the immediate path
 # and the idle-gate watcher, so a held delivery re-checks everything late.
+# Mode "heartbeat" = truthful still-busy visibility ping from the watcher.
 deliver_now() {
+  local mode="${1:-}"
   if [ "${NOTIFY_ALWAYS:-}" != "1" ] && user_is_watching "$ITERM_TTY"; then
     log "user is watching $ITERM_TTY — skipping notification"
     event_log "$HOOK_TYPE" skip_watching "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
@@ -475,12 +477,20 @@ deliver_now() {
   fi
   # Debounce Stop notifications so loop modes don't ping every iteration.
   # Permission/Question are explicit attention requests, never debounced.
-  if [ "$HOOK_TYPE" = "stop" ] && [ -n "$DEBOUNCE_KEY" ] && ! debounce_ok "$DEBOUNCE_KEY"; then
+  # Heartbeats skip the debounce AND must not mark its stamp: consuming it
+  # here would swallow the real "Ready" if the session idles minutes later.
+  if [ "$mode" != "heartbeat" ] \
+     && [ "$HOOK_TYPE" = "stop" ] && [ -n "$DEBOUNCE_KEY" ] && ! debounce_ok "$DEBOUNCE_KEY"; then
     log "debounced (notified within ${DEBOUNCE_SECONDS}s) — skipping"
     event_log "$HOOK_TYPE" debounced "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
     return 0
   fi
-  local ARGS=(-title "$TITLE" -message "$MSG" -sound default)
+  local msg="$MSG" outcome="notified"
+  if [ "$mode" = "heartbeat" ]; then
+    msg="Still working ($(( (HOLD_MAX + 59) / 60 ))+ min, no pause yet)"
+    outcome="heartbeat"
+  fi
+  local ARGS=(-title "$TITLE" -message "$msg" -sound default)
   if [ -n "$SUBTITLE" ]; then ARGS+=(-subtitle "$SUBTITLE"); fi
   if [ -n "$TARGET" ]; then
     ARGS+=(-group "claude-${DEBOUNCE_KEY:-$TARGET}")
@@ -493,7 +503,7 @@ deliver_now() {
   # chatter on stdout (it replaces grouped notifications on every fire), which
   # Claude Code would otherwise surface as spurious hook output.
   terminal-notifier "${ARGS[@]}" >/dev/null 2>&1 || true
-  event_log "$HOOK_TYPE" notified "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
+  event_log "$HOOK_TYPE" "$outcome" "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
   return 0
 }
 
@@ -501,36 +511,60 @@ deliver_now() {
 # spinner is an intermediate turn end (e.g. subagents still running). Hold it
 # and deliver when the session actually goes idle. The newest stop for a
 # session owns the hold stamp, so a burst collapses into one notification at
-# the true end. The deadline guarantees a late delivery over a lost one.
+# the true end. A session that stays busy a full NOTIFY_HOLD_MAX_SECONDS gets
+# a truthful "Still working" heartbeat on a clock that superseding stops
+# cannot reset — a busy session can be pinged late, but never starved silent.
 HOLD_MAX="${NOTIFY_HOLD_MAX_SECONDS:-600}"
 HOLD_POLL="${NOTIFY_HOLD_POLL_SECONDS:-10}"
-if [ "$HOOK_TYPE" = "stop" ] && [ "$HOLD_MAX" -gt 0 ] && [ -n "$RAW_TTY" ] \
-   && has_spinner "$SUBTITLE"; then
+if [ "$HOOK_TYPE" = "stop" ] && [ "$HOLD_MAX" -gt 0 ]; then
   HOLD_STAMP="$DEBOUNCE_DIR/hold-$(hash_key "$DEBOUNCE_KEY")"
-  HOLD_TOKEN="$$.$(date +%s)"
-  mkdir -p "$DEBOUNCE_DIR" 2>/dev/null || true
-  printf '%s' "$HOLD_TOKEN" > "$HOLD_STAMP" 2>/dev/null || true
-  event_log "$HOOK_TYPE" held "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
-  log "held: spinner in title — waiting for idle (poll ${HOLD_POLL}s, max ${HOLD_MAX}s)"
-  (
-    DEADLINE=$(( $(date +%s) + HOLD_MAX ))
-    while :; do
-      sleep "$HOLD_POLL"
-      # Superseded by a newer stop for this session? Its watcher delivers.
-      [ "$(cat "$HOLD_STAMP" 2>/dev/null)" = "$HOLD_TOKEN" ] || exit 0
-      TITLE_NOW=$(current_title "$RAW_TTY")
-      if ! has_spinner "$TITLE_NOW" || [ "$(date +%s)" -ge "$DEADLINE" ]; then
-        rm -f "$HOLD_STAMP" 2>/dev/null || true
-        if [ -n "$TITLE_NOW" ]; then
-          SUBTITLE="$TITLE_NOW"
-          DETAIL="$TITLE_NOW"
+  HOLD_SINCE="$DEBOUNCE_DIR/since-$(hash_key "$DEBOUNCE_KEY")"
+  if [ -n "$RAW_TTY" ] && has_spinner "$SUBTITLE"; then
+    HOLD_TOKEN="$$.$(date +%s)"
+    mkdir -p "$DEBOUNCE_DIR" 2>/dev/null || true
+    printf '%s' "$HOLD_TOKEN" > "$HOLD_STAMP" 2>/dev/null || true
+    # The FIRST un-delivered hold starts the heartbeat clock; superseding
+    # stops leave it alone (resetting it starved churning loop sessions).
+    if [ ! -f "$HOLD_SINCE" ]; then
+      date +%s > "$HOLD_SINCE" 2>/dev/null || true
+    fi
+    event_log "$HOOK_TYPE" held "$PROJECT" "$DEBOUNCE_KEY" "$TARGET" "$DETAIL"
+    log "held: spinner in title — waiting for idle (poll ${HOLD_POLL}s, heartbeat ${HOLD_MAX}s)"
+    (
+      while :; do
+        sleep "$HOLD_POLL"
+        # Superseded by a newer stop for this session? Its watcher delivers.
+        [ "$(cat "$HOLD_STAMP" 2>/dev/null)" = "$HOLD_TOKEN" ] || exit 0
+        TITLE_NOW=$(current_title "$RAW_TTY")
+        if ! has_spinner "$TITLE_NOW"; then
+          # Session paused for real: the notification the user wanted.
+          rm -f "$HOLD_STAMP" "$HOLD_SINCE" 2>/dev/null || true
+          if [ -n "$TITLE_NOW" ]; then
+            SUBTITLE="$TITLE_NOW"
+            DETAIL="$TITLE_NOW"
+          fi
+          deliver_now
+          exit 0
         fi
-        deliver_now
-        exit 0
-      fi
-    done
-  ) </dev/null >/dev/null 2>&1 &
-  exit 0
+        SINCE=$(cat "$HOLD_SINCE" 2>/dev/null || true)
+        case "$SINCE" in ''|*[!0-9]*) SINCE="" ;; esac
+        NOW=$(date +%s)
+        if [ -n "$SINCE" ] && [ "$NOW" -ge $(( SINCE + HOLD_MAX )) ]; then
+          # Still busy a full interval later: truthful heartbeat, re-arm.
+          if [ -n "$TITLE_NOW" ]; then
+            SUBTITLE="$TITLE_NOW"
+            DETAIL="$TITLE_NOW"
+          fi
+          deliver_now heartbeat
+          printf '%s' "$NOW" > "$HOLD_SINCE" 2>/dev/null || true
+        fi
+      done
+    ) </dev/null >/dev/null 2>&1 &
+    exit 0
+  fi
+  # Title already idle at stop time: clear any hold state so a stale
+  # watcher can't double-deliver after this immediate notification.
+  rm -f "$HOLD_STAMP" "$HOLD_SINCE" 2>/dev/null || true
 fi
 
 deliver_now

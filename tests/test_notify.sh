@@ -454,18 +454,43 @@ sleep 2.5
 assert_eq 1 "$(mock_calls terminal-notifier)" "burst collapses to a single delivery"
 teardown
 
-test_case "a held stop delivers at the cap even if the spinner never clears"
+test_case "a long-busy session gets a truthful heartbeat, then the real ping at idle"
 setup
+printf '⠐ forever (bun)' > "$SANDBOX/title"
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
 mock tmux 'case "$1" in
-  list-panes) printf "/dev/ttys9\tsessC\t⠐ forever (bun)\n" ;;
+  list-panes) printf "/dev/ttys9\tsessC\t%s\n" "$(cat '"$SANDBOX"'/title)" ;;
   list-clients) printf "/dev/ttys8\tsessC\n" ;;
 esac'
 mock osascript 'echo Finder'
 mock terminal-notifier 'true'
-NOTIFY_HOLD_MAX_SECONDS=2 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+NOTIFY_HOLD_MAX_SECONDS=3 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+sleep 4.5
+assert_eq 1 "$(mock_calls terminal-notifier)" "heartbeat delivered while still busy"
+assert_contains "$(mock_args terminal-notifier)" "Still working" "heartbeat is truthful, not 'Ready for input'"
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\tstop\theartbeat\tp\tsessC' "heartbeat outcome logged"
+printf '✳ forever (bun)' > "$SANDBOX/title"
+sleep 2
+assert_eq 2 "$(mock_calls terminal-notifier)" "real notification still arrives at idle"
+assert_contains "$(cat "$SANDBOX/events.tsv" 2>/dev/null)" $'\tstop\tnotified\tp\tsessC' "idle delivery logged after the heartbeat"
+teardown
+
+test_case "a superseding stop does not reset the heartbeat clock"
+setup
+printf '⠐ churn (bun)' > "$SANDBOX/title"
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tsessH\t%s\n" "$(cat '"$SANDBOX"'/title)" ;;
+  list-clients) printf "/dev/ttys8\tsessH\n" ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+NOTIFY_HOLD_MAX_SECONDS=4 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
+sleep 2
+NOTIFY_HOLD_MAX_SECONDS=4 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 sleep 3.5
-assert_eq 1 "$(mock_calls terminal-notifier)" "cap forces delivery — never silence"
+assert_eq 1 "$(mock_calls terminal-notifier)" "heartbeat fired on the original clock despite the newer stop"
+assert_contains "$(mock_args terminal-notifier)" "Still working" "churning session pings truthfully, never starves"
 teardown
 
 test_case "NOTIFY_HOLD_MAX_SECONDS=0 disables idle-gating"

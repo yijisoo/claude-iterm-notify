@@ -14,6 +14,7 @@ Native macOS notifications when [Claude Code](https://docs.anthropic.com/en/docs
 - **Click** switches to the correct iTerm2 tab — across multiple windows, and across tmux attach/detach.
 - **No nagging**: notifications are suppressed for a session you're already looking at, and rapid "stop" events (OMC loop modes) are debounced.
 - **No mid-work pings**: a stop that fires while the session is still visibly working (subagents running) is held and delivered when the session actually goes idle, and agent-team worker sessions don't ping at all when they finish.
+- **No silent marathons**: a session that stays busy a full heartbeat interval (10 min default) sends a truthful "Still working" ping, so long-running loops never disappear on you.
 
 ## Requirements
 
@@ -73,6 +74,7 @@ Claude Code hook fires
   → tab-less tmux session (worker/subagent) → no notification
   → agent-team worker session (claude --agent-id) → stop not notified
   → tab title still shows the working spinner → held until the session idles
+  → still busy a full heartbeat interval → truthful "Still working" ping
   → suppressed if you're already watching that tab
   → debounced if it pinged recently (keyed on the durable session name)
   → terminal-notifier shows the notification
@@ -111,7 +113,12 @@ Claude Code titles a working session with a braille-dot spinner frame (⠐, ⠂,
 A stop whose tab title still shows a spinner is a mid-work turn end: it is *held* (logged as `held`) and a small watcher re-checks the title every `NOTIFY_HOLD_POLL_SECONDS` until the session goes idle, then delivers — re-checking "are you already watching" at delivery time.
 The newest stop for a session owns the hold, so a burst of intermediate stops collapses into one notification at the true end; loop modes (ralph & co.) likewise coalesce to a single ping when the loop finishes.
 
-Both mechanisms hold or suppress only on a **positive** match, so they fail safe: if a future Claude Code changes the title glyphs or the `--agent-id` flag, the gate simply never engages and behavior reverts to notify-immediately — a notification can be late (capped by `NOTIFY_HOLD_MAX_SECONDS`), never silently lost.
+**Busy heartbeat.**
+A session that keeps working for a full `NOTIFY_HOLD_MAX_SECONDS` (10 min default) after a held stop gets a truthful "Still working" notification, and the clock re-arms for the next interval.
+The clock starts at the *first* un-delivered turn end and is deliberately **not** reset by newer stops — otherwise a loop session pausing every few minutes could push the deadline forever and stay silent indefinitely.
+Heartbeats bypass and never consume the stop debounce, so the real "Ready for input" still lands the moment the session truly idles.
+
+Both mechanisms hold or suppress only on a **positive** match, so they fail safe: if a future Claude Code changes the title glyphs or the `--agent-id` flag, the gate simply never engages and behavior reverts to notify-immediately — a notification can be late (bounded by the heartbeat interval), never silently lost.
 The event log below doubles as the canary: if mid-work deliveries reappear after a Claude Code update, `--report` will show it.
 
 ## Reviewing Notification Noise
@@ -141,7 +148,7 @@ The hook script lives at `~/.claude/hooks/notify.sh`. Behavior is tunable via en
 | `NOTIFY_DEBOUNCE_SECONDS` | `180` | Min seconds between "stop" notifications for the same session (loop dedup) |
 | `NOTIFY_DEBOUNCE_DIR` | `/tmp/claude-iterm-notify-debounce` | Where per-session debounce stamps are kept |
 | `NOTIFY_EVENT_LOG` | `~/.local/state/claude-iterm-notify/events.tsv` | Event-log path; `0` disables logging |
-| `NOTIFY_HOLD_MAX_SECONDS` | `600` | Max seconds to hold a mid-work stop; `0` disables idle-gating |
+| `NOTIFY_HOLD_MAX_SECONDS` | `600` | Heartbeat interval for long-busy sessions (also max hold before the first "Still working" ping); `0` disables idle-gating |
 | `NOTIFY_HOLD_POLL_SECONDS` | `10` | How often a held stop re-checks the tab title |
 | `NOTIFY_AGENT_STOPS=1` | unset | Also notify when agent-team worker sessions stop |
 | `NOTIFY_DEBUG=1` | unset | Write a decision trace to `/tmp/claude-iterm-notification-*.log` |
@@ -162,7 +169,7 @@ A dependency-free test suite (pure bash, no `bats`) lives in `tests/`. It runs `
 
 (The harness sets `NOTIFY_TEST=1` so `notify.sh` skips its Homebrew PATH prepend and the mock tools on `PATH` take effect.)
 
-Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing, worker-session stop suppression, idle-gating (hold, supersede, cap, disable, late watching re-check), event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
+Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
 
 ## Files
 
@@ -187,6 +194,7 @@ Set `NOTIFY_DEBUG=1` (in the environment Claude Code runs in) to capture a trace
 | No notification while in a loop | Expected — OMC loop "stop" events are debounced to once per `NOTIFY_DEBOUNCE_SECONDS`; Permission/Question always fire |
 | No notification for the tab I'm on | Expected — suppressed while you're watching it; set `NOTIFY_ALWAYS=1` to override |
 | "Ready for input" arrives ~10s after the summary | Expected — idle-gating polls the tab title every `NOTIFY_HOLD_POLL_SECONDS` |
+| A "Still working" notification | Expected — that session has been continuously busy for `NOTIFY_HOLD_MAX_SECONDS`; it's a visibility heartbeat, not "done" |
 | No stop notification from a fleet/worker tab | Expected — `--agent-id` sessions don't notify on stop; `NOTIFY_AGENT_STOPS=1` restores |
 
 ## License
