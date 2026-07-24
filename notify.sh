@@ -228,7 +228,12 @@ EOF
 # without this every iteration would ping. One notification per window.
 # Keyed on a DURABLE id (tmux session name, or tty for direct) so it survives
 # the session being reattached to a different tab.
-DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-180}"
+# 20 min, not the pre-idle-gating 180s: idle-gating already collapses raw
+# rapid-fire stops into one delivery per real pause, so what debounce now
+# throttles is repeat "Ready for input" pings from a session that keeps
+# cycling through genuine idle points every few minutes (loop modes like
+# ralph/autopilot/standup-autopilot) — 180s pinged almost every cycle.
+DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-1200}"
 DEBOUNCE_DIR="${NOTIFY_DEBOUNCE_DIR:-/tmp/claude-iterm-notify-debounce}"
 
 # Filesystem-safe stamp name for a session key (shared by debounce + hold).
@@ -447,10 +452,17 @@ log "TARGET=$TARGET SUBTITLE=$SUBTITLE DEBOUNCE_KEY=$DEBOUNCE_KEY RAW_TTY=$RAW_T
 # Event-log detail: what the session was doing (stop) or what it asked (rest).
 if [ "$HOOK_TYPE" = "stop" ]; then DETAIL="$SUBTITLE"; else DETAIL="$MSG"; fi
 
-# Tab-less tmux session (worker/subagent/stale run) -> do not notify at all.
+# Tab-less tmux session (worker/subagent/stale run): a "stop" has nothing to
+# click into, so it's not notified. Permission/Question are different — the
+# worker is genuinely blocked waiting on the user, so still notify, just
+# without a click target (there's no client tab to focus).
 if [ "$TARGET" = "SKIP" ]; then
-  event_log "$HOOK_TYPE" skip_no_tab "$PROJECT" "$DEBOUNCE_KEY" - "$DETAIL"
-  exit 0
+  if [ "$HOOK_TYPE" = "stop" ]; then
+    event_log "$HOOK_TYPE" skip_no_tab "$PROJECT" "$DEBOUNCE_KEY" - "$DETAIL"
+    exit 0
+  fi
+  log "tab-less worker but hook=$HOOK_TYPE is an attention request — notifying without a click target"
+  TARGET=""
 fi
 
 ITERM_TTY="${TARGET#tty:}"   # the tab's tty (empty if TARGET is empty)

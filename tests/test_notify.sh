@@ -68,6 +68,35 @@ assert_contains "$tn" "claude-omc-sess" "groups by the durable session name"
 teardown
 
 # ── Stop from a tmux session with NO attached tab -> skipped ───────
+test_case "permission from a tab-less tmux session still notifies (no click target)"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tomc-worker\twork\n" ;;
+  list-clients) : ;;          # no client attached to any session
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" permission <<<'{"cwd":"/x/proj","message":"allow?"}'
+tn="$(mock_args terminal-notifier)"
+assert_eq 1 "$(mock_calls terminal-notifier)" "tab-less worker's permission prompt still notifies"
+assert_contains "$tn" "-activate com.googlecode.iterm2" "no tab to click into, so raise iTerm generically"
+assert_not_contains "$tn" "--focus" "no click callback without a tab"
+teardown
+
+test_case "question from a tab-less tmux session still notifies"
+setup
+mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
+mock tmux 'case "$1" in
+  list-panes) printf "/dev/ttys9\tomc-worker\twork\n" ;;
+  list-clients) : ;;
+esac'
+mock osascript 'echo Finder'
+mock terminal-notifier 'true'
+run_notify bash "$NOTIFY" question <<<'{"cwd":"/x/proj","message":"which option?"}'
+assert_eq 1 "$(mock_calls terminal-notifier)" "tab-less worker's question still notifies"
+teardown
+
 test_case "stop in a tab-less tmux session does not notify"
 setup
 mock ps 'case "$*" in *"-o tty="*) echo ttys9 ;; *"-o ppid="*) echo 1 ;; esac'
@@ -135,6 +164,12 @@ mock terminal-notifier 'true'
 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 run_notify bash "$NOTIFY" stop <<<'{"cwd":"/x/p","stop_hook_active":false}'
 assert_eq 1 "$(mock_calls terminal-notifier)" "only the first of two rapid stops notifies"
+teardown
+
+test_case "production default debounce window is 20 minutes, past typical loop cadence"
+setup
+assert_contains "$(grep 'DEBOUNCE_SECONDS="\${NOTIFY_DEBOUNCE_SECONDS:-' "$NOTIFY")" "1200" \
+  "default outlives the ~3-8 min cycles observed from ralph/autopilot/standup-autopilot loops"
 teardown
 
 test_case "debounce expires after the window"

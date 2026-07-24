@@ -93,7 +93,8 @@ Claude Code hook fires
 
 If Claude runs inside a tmux session (as [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) does — one tmux session per agent), the tab you see is just a *client* attached to that session. `notify.sh` maps `pane tty → tmux session → attached client tty → iTerm2 tab`, so click-to-focus lands on the right tab.
 
-Sessions with **no attached tab** — OMC background workers/subagents, or stale runs you've moved on from — are intentionally **not** notified: there is no tab to take you to, and an active run always has its tab. This keeps notifications tied to things you can actually click into, and avoids spawning or hijacking tabs.
+Sessions with **no attached tab** — OMC background workers/subagents, or stale runs you've moved on from — are intentionally **not** notified on `stop`: there is no tab to take you to, and an active run always has its tab. This keeps "done" notifications tied to things you can actually click into, and avoids spawning or hijacking tabs.
+Permission and Question prompts are the exception: a tab-less worker blocked on one is genuinely stuck waiting on you, so it still notifies — just without a click target, since there's no client tab to focus.
 
 `tmux` is found even from terminal-notifier's minimal-PATH click callback (the script prepends Homebrew's bin).
 
@@ -121,6 +122,12 @@ Heartbeats bypass and never consume the stop debounce, so the real "Ready for in
 Both mechanisms hold or suppress only on a **positive** match, so they fail safe: if a future Claude Code changes the title glyphs or the `--agent-id` flag, the gate simply never engages and behavior reverts to notify-immediately — a notification can be late (bounded by the heartbeat interval), never silently lost.
 The event log below doubles as the canary: if mid-work deliveries reappear after a Claude Code update, `--report` will show it.
 
+**Debounce vs. cycling loop sessions.**
+There is no reliable signal for "this pause is the loop's final stop" vs. "this pause is between iterations" — loop modes (ralph/autopilot/standup-autopilot) idle and resume on their own schedule regardless of whether you act on a notification, often every few minutes.
+Notifying on every one of those idle points means most clicks land on a session that has already moved on to its next iteration by the time you get there.
+So `stop` deliveries are debounced per session at `NOTIFY_DEBOUNCE_SECONDS` (20 min default — past a typical loop's cadence): the first ping and any Permission/Question prompt are always immediate, but repeat "Ready for input" pings from the same still-cycling session are suppressed until the window elapses.
+The cost is symmetric: a session that pings once and then sits genuinely idle-and-waiting won't ping again on its own, so if you miss that first notification you'll only notice it by switching to the tab — there's no re-nagging mechanism (a lower-severity, self-healing failure than pinging you for work that has already moved on).
+
 ## Reviewing Notification Noise
 
 Every hook invocation appends one line to a local event log — including the suppressed ones — so you can see where your notifications actually come from.
@@ -145,7 +152,7 @@ The hook script lives at `~/.claude/hooks/notify.sh`. Behavior is tunable via en
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `NOTIFY_ALWAYS=1` | unset | Notify even for a session you're actively watching |
-| `NOTIFY_DEBOUNCE_SECONDS` | `180` | Min seconds between "stop" notifications for the same session (loop dedup) |
+| `NOTIFY_DEBOUNCE_SECONDS` | `1200` (20 min) | Min seconds between repeat "stop" notifications for the same session (throttles cycling loop sessions, not the first ping) |
 | `NOTIFY_DEBOUNCE_DIR` | `/tmp/claude-iterm-notify-debounce` | Where per-session debounce stamps are kept |
 | `NOTIFY_EVENT_LOG` | `~/.local/state/claude-iterm-notify/events.tsv` | Event-log path; `0` disables logging |
 | `NOTIFY_HOLD_MAX_SECONDS` | `600` | Heartbeat interval for long-busy sessions (also max hold before the first "Still working" ping); `0` disables idle-gating |
@@ -156,7 +163,7 @@ The hook script lives at `~/.claude/hooks/notify.sh`. Behavior is tunable via en
 Other tweaks:
 - **Disable "Ready for input"** — remove the `Stop` hook from `~/.claude/settings.json`.
 - **Change the sound** — replace `-sound default` in the script (e.g. `-sound Ping`, `-sound Glass`; see `/System/Library/Sounds/`).
-- **Debounce window** — `NOTIFY_DEBOUNCE_SECONDS` is read from the environment, or change the `180` default in the script. Permission/Question prompts are never debounced.
+- **Debounce window** — `NOTIFY_DEBOUNCE_SECONDS` is read from the environment, or change the `1200` default in the script. Permission/Question prompts are never debounced.
 
 ## Testing
 
@@ -169,7 +176,7 @@ A dependency-free test suite (pure bash, no `bats`) lives in `tests/`. It runs `
 
 (The harness sets `NOTIFY_TEST=1` so `notify.sh` skips its Homebrew PATH prepend and the mock tools on `PATH` take effect.)
 
-Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
+Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip on stop, still notify on permission/question / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing at its 20-min default, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
 
 ## Files
 
@@ -191,7 +198,7 @@ Set `NOTIFY_DEBUG=1` (in the environment Claude Code runs in) to capture a trace
 | No notifications | Run `which terminal-notifier`; ensure macOS notifications are allowed for terminal-notifier |
 | No sound | System Settings > Notifications > terminal-notifier > enable Sounds |
 | Click doesn't switch tab (tmux) | Ensure `tmux` is installed and the session still exists; check the debug log for the resolved client tty |
-| No notification while in a loop | Expected — OMC loop "stop" events are debounced to once per `NOTIFY_DEBOUNCE_SECONDS`; Permission/Question always fire |
+| No notification while in a loop | Expected — OMC loop "stop" events are debounced to once per `NOTIFY_DEBOUNCE_SECONDS` (20 min default); Permission/Question always fire |
 | No notification for the tab I'm on | Expected — suppressed while you're watching it; set `NOTIFY_ALWAYS=1` to override |
 | "Ready for input" arrives ~10s after the summary | Expected — idle-gating polls the tab title every `NOTIFY_HOLD_POLL_SECONDS` |
 | A "Still working" notification | Expected — that session has been continuously busy for `NOTIFY_HOLD_MAX_SECONDS`; it's a visibility heartbeat, not "done" |
