@@ -151,7 +151,8 @@ Clicks on notifications are recorded too (via the click callback), which tells y
 ~/.claude/hooks/notify.sh --report 2    # ...the last 2 days
 ```
 
-The report shows delivered vs. suppressed counts, delivered notifications by type / project / session, the tab-less worker sessions that were skipped, click-through rate, and "bursts" — notifications landing within 60 seconds of the previous one, which is the pressure you feel when many parallel sessions ping at once.
+The report shows actionable vs. suppressed counts, actionable notifications by type / project / session, the tab-less worker sessions that were skipped, click-through rate, and "bursts" — notifications landing within 60 seconds of the previous one, which is the pressure you feel when many parallel sessions ping at once.
+"Actionable" means `notified` — a genuine decision point (ready for input, permission, question). Busy-heartbeat pings are a real notification too but a deliberately lower-urgency FYI by design, so they're shown separately (never hidden) and kept out of the click-through denominator — except in "Bursts", which counts both, since a heartbeat contributes to notification-pressure just as much as an actionable one does.
 
 The log is a plain TSV at `~/.local/state/claude-iterm-notify/events.tsv` with fields: timestamp, event, outcome, project, session, target, detail.
 It is size-capped, with one `.old` generation kept (roughly weeks of data).

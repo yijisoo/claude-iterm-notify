@@ -174,14 +174,19 @@ if [ "${1:-}" = "--report" ]; then
     | awk -F'\t' -v c="$CUTOFF" 'c == "" || $1 >= c' > "$WINDOW" || true
 
   TOTAL=$(wc -l < "$WINDOW" | tr -d ' ')
-  DELIVERED=$(awk -F'\t' '$3 == "notified"' "$WINDOW" | wc -l | tr -d ' ')
+  # "Actionable" = notified (a genuine decision point: ready/permission/question).
+  # Heartbeat is a real terminal-notifier send too, but deliberately a lower-
+  # urgency FYI by design — kept out of click-through's denominator (that
+  # metric means "did you act on a decision point"), but never hidden.
+  ACTIONABLE=$(awk -F'\t' '$3 == "notified"' "$WINDOW" | wc -l | tr -d ' ')
+  HEARTBEATS=$(awk -F'\t' '$3 == "heartbeat"' "$WINDOW" | wc -l | tr -d ' ')
   CLICKS=$(awk -F'\t' '$2 == "click"' "$WINDOW" | wc -l | tr -d ' ')
   RETRACTED=$(awk -F'\t' '$2 == "retract"' "$WINDOW" | wc -l | tr -d ' ')
 
   echo "claude-iterm-notify — last $DAYS day(s)"
   echo "log: $EVENT_LOG"
   echo
-  echo "Events: $TOTAL   (delivered $DELIVERED, clicks $CLICKS, retracted $RETRACTED)"
+  echo "Events: $TOTAL   (actionable $ACTIONABLE, heartbeat $HEARTBEATS, clicks $CLICKS, retracted $RETRACTED)"
   echo
   echo "Outcomes:"
   awk -F'\t' '$2 != "click" && $2 != "retract" { print $3 }' "$WINDOW" | sort | uniq -c | sort -rn || true
@@ -198,20 +203,22 @@ if [ "${1:-}" = "--report" ]; then
   echo "Suppressed tab-less sessions (top):"
   awk -F'\t' '$3 == "skip_no_tab" { print $4 " / " $5 }' "$WINDOW" | sort | uniq -c | sort -rn | head -10 || true
   echo
-  # Burst = a delivered notification landing <=60s after the previous one
-  # (any session) — the "many parallel sessions ping at once" pressure.
+  # Burst = a real notification (actionable OR heartbeat — both are genuine
+  # terminal-notifier sends) landing <=60s after the previous one (any
+  # session) — the "many parallel sessions ping at once" pressure, which a
+  # heartbeat contributes to regardless of its lower urgency.
   # Day-seconds comparison; bursts spanning midnight are not counted.
-  BURSTS=$(awk -F'\t' '$3 == "notified" {
+  BURSTS=$(awk -F'\t' '$3 == "notified" || $3 == "heartbeat" {
       d = substr($1, 1, 10)
       split(substr($1, 12), a, ":")
       s = a[1]*3600 + a[2]*60 + a[3]
       if (d == pd && s >= ps && s - ps <= 60) n++
       pd = d; ps = s
     } END { print n + 0 }' "$WINDOW")
-  if [ "$DELIVERED" -gt 0 ]; then
-    echo "Click-through: $CLICKS of $DELIVERED delivered ($((100 * CLICKS / DELIVERED))%)"
+  if [ "$ACTIONABLE" -gt 0 ]; then
+    echo "Click-through: $CLICKS of $ACTIONABLE actionable delivered ($((100 * CLICKS / ACTIONABLE))%)"
   fi
-  echo "Bursts: $BURSTS delivered within 60s of the previous delivered notification"
+  echo "Bursts: $BURSTS deliveries (actionable + heartbeat) within 60s of the previous one"
   echo "Retracted: $RETRACTED stale notifications cleared before you could click a now-outdated one"
   exit 0
 fi
