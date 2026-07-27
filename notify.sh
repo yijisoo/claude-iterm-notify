@@ -60,12 +60,16 @@ event_log() {
   size=$(stat -f %z "$EVENT_LOG" 2>/dev/null || echo 0)
   if [ "$size" -gt "$EVENT_LOG_MAX_BYTES" ] 2>/dev/null; then
     mv -f "$EVENT_LOG" "$EVENT_LOG.old" 2>/dev/null || true
+    chmod 600 "$EVENT_LOG.old" 2>/dev/null || true
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%Y-%m-%dT%H:%M:%S)" \
     "$(clean_field "$1")" "$(clean_field "$2")" "$(clean_field "$3")" \
     "$(clean_field "$4")" "$(clean_field "$5")" "$(clean_field "$6")" \
     >> "$EVENT_LOG" 2>/dev/null || true
+  # Enforced on every write (not just at creation) so the log stays
+  # owner-only even if it pre-existed with looser permissions.
+  chmod 600 "$EVENT_LOG" 2>/dev/null || true
   return 0
 }
 
