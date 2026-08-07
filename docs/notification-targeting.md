@@ -90,8 +90,11 @@ Click callback shrinks to one branch:
 
 **Removed**: the `tmux:` target scheme, `open_iterm_tab`, click-time
 `tmux list-clients` / `has-session` / `switch-client`, and the new-tab and
-"reuse a client" branches. `as_escape` is no longer needed (no command is fed
-to iTerm2); `sq_escape` is still used for the `--focus` callback argument.
+"reuse a client" branches. `as_escape` was removed at this point too (no
+command was fed to iTerm2 in the targeting path); it was later reintroduced
+(`55d3fe0`) for the opt-in `SessionStart` title-setting hook, which does feed
+a command to iTerm2 — see the note under Review refinements below.
+`sq_escape` is still used for the `--focus` callback argument.
 
 ## Edge cases
 
@@ -126,8 +129,14 @@ to iTerm2); `sq_escape` is still used for the `--focus` callback argument.
   *before* the watching-suppression and debounce checks, and must **not** fall
   through to the old `-activate` no-target branch.
 - **Keep `sq_escape`** for the `--focus '<target>'` callback string (defensive;
-  costs nothing). **Delete** `as_escape` and `open_iterm_tab` (no command is
-  fed to iTerm2 anymore).
+  costs nothing). **Delete** `as_escape` and `open_iterm_tab` at this point
+  (no command is fed to iTerm2 in the targeting/click path).
+  **Update (2026-07-24, `55d3fe0`):** `as_escape` was reintroduced for the
+  opt-in `SessionStart` → `notify.sh title` hook (`notify.sh:107-112`, used at
+  `notify.sh:492`), which sets the iTerm2 session name to the project's
+  basename via `set name of s to "..."` — a real command fed to iTerm2, so
+  the string must be AppleScript-escaped. `open_iterm_tab` remains deleted;
+  only `as_escape` came back.
 - Keep `|| true` on every `tmux list-*` pipeline (guards `set -euo pipefail`).
 - Update the header comment block — drop topology 3 and the `tmux:` callback.
 - `user_is_watching` now receives the resolved tab tty (first client for the
