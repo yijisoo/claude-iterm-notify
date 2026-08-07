@@ -13,6 +13,9 @@ Native macOS notifications when [Claude Code](https://docs.anthropic.com/en/docs
 - **Subtitle** shows what Claude was doing (the iTerm2 session name, or the tmux pane title for tmux sessions).
 - **Click** switches to the correct iTerm2 tab — across multiple windows, and across tmux attach/detach.
 - **No nagging**: notifications are suppressed for a session you're already looking at, and rapid "stop" events (OMC loop modes) are debounced.
+- **No mid-work pings**: a stop that fires while the session is still visibly working (subagents running) is held and delivered when the session actually goes idle, and agent-team worker sessions don't ping at all when they finish.
+- **No silent marathons**: a session that stays busy a full heartbeat interval (10 min default) sends a truthful "Still working" ping, so long-running loops never disappear on you.
+- **No stale notifications**: if you resolve a session directly at the terminal instead of clicking through, the outdated notification is retracted from Notification Center the moment the session does anything else — you won't click an old banner later and land on a session that's already moved on.
 
 ## Requirements
 
@@ -70,6 +73,9 @@ The guiding rule: **notify only when the firing session is shown in a live iTerm
 Claude Code hook fires
   → notify.sh resolves the iTerm2 tab for the session (tty)
   → tab-less tmux session (worker/subagent) → no notification
+  → agent-team worker session (claude --agent-id) → stop not notified
+  → tab title still shows the working spinner → held until the session idles
+  → still busy a full heartbeat interval → truthful "Still working" ping
   → suppressed if you're already watching that tab
   → debounced if it pinged recently (keyed on the durable session name)
   → terminal-notifier shows the notification
@@ -83,14 +89,75 @@ Claude Code hook fires
 | `Stop` | — | Claude finished responding |
 | `Notification` | `permission_prompt` | Claude needs tool approval |
 | `Notification` | `elicitation_dialog` | Claude is asking a question |
+| `SessionStart` | — | A session starts/resumes (title-setting, opt-in — see below) |
 
 ## tmux & OMC
 
 If Claude runs inside a tmux session (as [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) does — one tmux session per agent), the tab you see is just a *client* attached to that session. `notify.sh` maps `pane tty → tmux session → attached client tty → iTerm2 tab`, so click-to-focus lands on the right tab.
 
-Sessions with **no attached tab** — OMC background workers/subagents, or stale runs you've moved on from — are intentionally **not** notified: there is no tab to take you to, and an active run always has its tab. This keeps notifications tied to things you can actually click into, and avoids spawning or hijacking tabs.
+Sessions with **no attached tab** — OMC background workers/subagents, or stale runs you've moved on from — are intentionally **not** notified on `stop`: there is no tab to take you to, and an active run always has its tab. This keeps "done" notifications tied to things you can actually click into, and avoids spawning or hijacking tabs.
+Permission and Question prompts are the exception: a tab-less worker blocked on one is genuinely stuck waiting on you, so it still notifies — just without a click target, since there's no client tab to focus.
+
+## Tab Titles (opt-in)
+
+The notification **subtitle** is "what Claude was doing" — the iTerm2 session name or tmux pane title. When a tab still has its shell default (an unnamed tab, plain `zsh`), the subtitle is empty or useless. Set `NOTIFY_SET_TITLE=1` in the environment Claude Code runs in to have a `SessionStart` hook set the tab title to the project name (`basename "$cwd"`) directly — via `tmux select-pane -T` inside tmux, or the iTerm2 session name otherwise.
+
+This is off by default. Claude Code's `sessionTitle` hook output exists but its effect on the actual terminal/tmux title is undocumented (it may be purely internal to Claude Code's own UI), so this doesn't depend on it — it sets the terminal title itself, directly. And there's no reliable way to tell "this tab still has its default title" from "the user deliberately named this tab" apart, so rather than guess, the opt-in itself is the safety net: once enabled, every `SessionStart` unconditionally (re)sets the title to the project name, including tabs you named yourself.
 
 `tmux` is found even from terminal-notifier's minimal-PATH click callback (the script prepends Homebrew's bin).
+
+## Subagents & Mid-Work Stops
+
+Claude Code fires the `Stop` hook at **every** turn end — including intermediate ones, when the main agent pauses while background subagents are still running.
+There is no documented payload field distinguishing those from the final "all work done, summary written" stop, so this tool uses two empirical mechanisms:
+
+**Worker suppression.**
+Sessions spawned as agent-team workers run `claude --agent-id <agent>@<session>`; sessions you drive don't.
+A `stop` from a worker session is suppressed (logged as `skip_agent_worker`) — its "done" is the orchestrator's business.
+Permission/Question prompts from workers still notify, because a worker blocked on approval is stuck until you act.
+Set `NOTIFY_AGENT_STOPS=1` to restore worker stop notifications.
+
+**Idle-gating.**
+Claude Code titles a working session with a braille-dot spinner frame (⠐, ⠂, …) and an idle one with `✳`.
+A stop whose tab title still shows a spinner is a mid-work turn end: it is *held* (logged as `held`) and a small watcher re-checks the title every `NOTIFY_HOLD_POLL_SECONDS` until the session goes idle, then delivers — re-checking "are you already watching" at delivery time.
+The newest stop for a session owns the hold, so a burst of intermediate stops collapses into one notification at the true end; loop modes (ralph & co.) likewise coalesce to a single ping when the loop finishes.
+
+**Busy heartbeat.**
+A session that keeps working for a full `NOTIFY_HOLD_MAX_SECONDS` (10 min default) after a held stop gets a truthful "Still working" notification, and the clock re-arms for the next interval.
+The clock starts at the *first* un-delivered turn end and is deliberately **not** reset by newer stops — otherwise a loop session pausing every few minutes could push the deadline forever and stay silent indefinitely.
+Heartbeats bypass and never consume the stop debounce, so the real "Ready for input" still lands the moment the session truly idles.
+
+Both mechanisms hold or suppress only on a **positive** match, so they fail safe: if a future Claude Code changes the title glyphs or the `--agent-id` flag, the gate simply never engages and behavior reverts to notify-immediately — a notification can be late (bounded by the heartbeat interval), never silently lost.
+The event log below doubles as the canary: if mid-work deliveries reappear after a Claude Code update, `--report` will show it.
+
+**Retracting stale notifications.**
+Every notification is tagged with a `-group` id derived from the session's durable identity (tmux session name, or tty), and every hook invocation opens by checking whether that session already has one outstanding — if so, it's removed from Notification Center via `terminal-notifier -remove` before anything else happens, regardless of whether this new event goes on to show a fresh one.
+This matters most for the case a same-session *replacement* notification doesn't cover: you resolve a permission prompt or a question directly at the terminal (not by clicking the notification), and the session goes on to do more work without immediately producing another notification (idle-gating holds it, or the next stop gets debounced) — the outdated banner would otherwise sit in Notification Center until whenever the next delivery happens to occur. Now it's cleared the moment the session shows any sign of life.
+Each retraction is logged as its own `retract` event, so `--report`'s "Retracted: N" line tells you how often this is actually saving you from a stale click.
+
+**Debounce vs. cycling loop sessions.**
+There is no reliable signal for "this pause is the loop's final stop" vs. "this pause is between iterations" — loop modes (ralph/autopilot/standup-autopilot) idle and resume on their own schedule regardless of whether you act on a notification, often every few minutes.
+Notifying on every one of those idle points means most clicks land on a session that has already moved on to its next iteration by the time you get there.
+So `stop` deliveries are debounced per session at `NOTIFY_DEBOUNCE_SECONDS` (20 min default — past a typical loop's cadence): the first ping and any Permission/Question prompt are always immediate, but repeat "Ready for input" pings from the same still-cycling session are suppressed until the window elapses.
+The cost is symmetric: a session that pings once and then sits genuinely idle-and-waiting won't ping again on its own, so if you miss that first notification you'll only notice it by switching to the tab — there's no re-nagging mechanism (a lower-severity, self-healing failure than pinging you for work that has already moved on).
+
+## Reviewing Notification Noise
+
+Every hook invocation appends one line to a local event log — including the suppressed ones — so you can see where your notifications actually come from.
+Clicks on notifications are recorded too (via the click callback), which tells you which notifications were worth acting on.
+
+```bash
+~/.claude/hooks/notify.sh --report      # summarize the last 7 days
+~/.claude/hooks/notify.sh --report 2    # ...the last 2 days
+```
+
+The report shows actionable vs. suppressed counts, actionable notifications by type / project / session, the tab-less worker sessions that were skipped, click-through rate, and "bursts" — notifications landing within 60 seconds of the previous one, which is the pressure you feel when many parallel sessions ping at once.
+"Actionable" means `notified` — a genuine decision point (ready for input, permission, question). Busy-heartbeat pings are a real notification too but a deliberately lower-urgency FYI by design, so they're shown separately (never hidden) and kept out of the click-through denominator — except in "Bursts", which counts both, since a heartbeat contributes to notification-pressure just as much as an actionable one does.
+
+The log is a plain TSV at `~/.local/state/claude-iterm-notify/events.tsv` with fields: timestamp, event, outcome, project, session, target, detail.
+It is size-capped, with one `.old` generation kept (roughly weeks of data).
+Permission/question message text is stored (truncated to 160 chars) in the detail column; set `NOTIFY_EVENT_LOG=0` to disable logging entirely, or point the variable at another path.
+Uninstalling removes the log.
 
 ## Customizing
 
@@ -99,14 +166,19 @@ The hook script lives at `~/.claude/hooks/notify.sh`. Behavior is tunable via en
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `NOTIFY_ALWAYS=1` | unset | Notify even for a session you're actively watching |
-| `NOTIFY_DEBOUNCE_SECONDS` | `180` | Min seconds between "stop" notifications for the same session (loop dedup) |
+| `NOTIFY_DEBOUNCE_SECONDS` | `1200` (20 min) | Min seconds between repeat "stop" notifications for the same session (throttles cycling loop sessions, not the first ping) |
 | `NOTIFY_DEBOUNCE_DIR` | `/tmp/claude-iterm-notify-debounce` | Where per-session debounce stamps are kept |
+| `NOTIFY_EVENT_LOG` | `~/.local/state/claude-iterm-notify/events.tsv` | Event-log path; `0` disables logging |
+| `NOTIFY_HOLD_MAX_SECONDS` | `600` | Heartbeat interval for long-busy sessions (also max hold before the first "Still working" ping); `0` disables idle-gating |
+| `NOTIFY_HOLD_POLL_SECONDS` | `10` | How often a held stop re-checks the tab title |
+| `NOTIFY_AGENT_STOPS=1` | unset | Also notify when agent-team worker sessions stop |
+| `NOTIFY_SET_TITLE=1` | unset | Set the tab title to the project name on `SessionStart` (see Tab Titles above) |
 | `NOTIFY_DEBUG=1` | unset | Write a decision trace to `/tmp/claude-iterm-notification-*.log` |
 
 Other tweaks:
 - **Disable "Ready for input"** — remove the `Stop` hook from `~/.claude/settings.json`.
 - **Change the sound** — replace `-sound default` in the script (e.g. `-sound Ping`, `-sound Glass`; see `/System/Library/Sounds/`).
-- **Debounce window** — `NOTIFY_DEBOUNCE_SECONDS` is read from the environment, or change the `180` default in the script. Permission/Question prompts are never debounced.
+- **Debounce window** — `NOTIFY_DEBOUNCE_SECONDS` is read from the environment, or change the `1200` default in the script. Permission/Question prompts are never debounced.
 
 ## Testing
 
@@ -119,7 +191,7 @@ A dependency-free test suite (pure bash, no `bats`) lives in `tests/`. It runs `
 
 (The harness sets `NOTIFY_TEST=1` so `notify.sh` skips its Homebrew PATH prepend and the mock tools on `PATH` take effect.)
 
-Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing, and the install/uninstall settings.json merge & removal logic.
+Covers: tab resolution (direct tty / attached tmux / tab-less tmux → skip on stop, still notify on permission/question / no-tty fallback), `--focus` tab selection, session identification + subtitle, the watching-suppression and `NOTIFY_ALWAYS` override, durable-key debouncing at its 20-min default, worker-session stop suppression, idle-gating (hold, supersede, busy heartbeat, disable, late watching re-check), stale-notification retraction and its `retract` event / "Retracted:" report line, the opt-in `SessionStart` title hook (tmux + iTerm2, AppleScript-string escaping, never launches iTerm2), event logging (outcomes, clicks, rotation, disable, unwritable-path safety) and `--report`, and the install/uninstall settings.json merge & removal logic.
 
 ## Files
 
@@ -137,11 +209,15 @@ Set `NOTIFY_DEBUG=1` (in the environment Claude Code runs in) to capture a trace
 
 | Problem | Fix |
 |---------|-----|
+| Too many notifications | Run `~/.claude/hooks/notify.sh --report` to see which sessions/types are noisy |
 | No notifications | Run `which terminal-notifier`; ensure macOS notifications are allowed for terminal-notifier |
 | No sound | System Settings > Notifications > terminal-notifier > enable Sounds |
 | Click doesn't switch tab (tmux) | Ensure `tmux` is installed and the session still exists; check the debug log for the resolved client tty |
-| No notification while in a loop | Expected — OMC loop "stop" events are debounced to once per `NOTIFY_DEBOUNCE_SECONDS`; Permission/Question always fire |
+| No notification while in a loop | Expected — OMC loop "stop" events are debounced to once per `NOTIFY_DEBOUNCE_SECONDS` (20 min default); Permission/Question always fire |
 | No notification for the tab I'm on | Expected — suppressed while you're watching it; set `NOTIFY_ALWAYS=1` to override |
+| "Ready for input" arrives ~10s after the summary | Expected — idle-gating polls the tab title every `NOTIFY_HOLD_POLL_SECONDS` |
+| A "Still working" notification | Expected — that session has been continuously busy for `NOTIFY_HOLD_MAX_SECONDS`; it's a visibility heartbeat, not "done" |
+| No stop notification from a fleet/worker tab | Expected — `--agent-id` sessions don't notify on stop; `NOTIFY_AGENT_STOPS=1` restores |
 
 ## License
 

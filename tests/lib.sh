@@ -55,6 +55,15 @@ mock_args() {
   [ -f "$CALLS/$name.args" ] && cat "$CALLS/$name.args" || true
 }
 
+# How many of a mock's invocations were an actual notification send (has
+# -title), as opposed to a -remove (stale-notification retraction) or
+# --focus click callback. Lets debounce/repeat tests assert on sends alone,
+# independent of how many housekeeping -remove calls also happened.
+mock_sends() {
+  local name="$1"
+  mock_args "$name" | grep -c -- '-title' || true
+}
+
 # Full recorded stdin (concatenation of all invocations).
 mock_stdin() {
   local name="$1"
@@ -69,6 +78,9 @@ run_notify() {
   NOTIFY_DEBOUNCE_DIR="$SANDBOX/debounce" \
   NOTIFY_DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-180}" \
   NOTIFY_ALWAYS="${NOTIFY_ALWAYS:-}" \
+  NOTIFY_EVENT_LOG="${NOTIFY_EVENT_LOG:-$SANDBOX/events.tsv}" \
+  NOTIFY_HOLD_POLL_SECONDS="${NOTIFY_HOLD_POLL_SECONDS:-1}" \
+  NOTIFY_HOLD_MAX_SECONDS="${NOTIFY_HOLD_MAX_SECONDS:-5}" \
   PATH="$MOCKBIN:$PATH" \
   HOME="$SANDBOX/home" \
   "$@"

@@ -1,0 +1,27 @@
+{
+  "sessions": [
+    {
+      "startedAt": "2026-07-25T23:19:43Z",
+      "baseline": { "test": "pass", "lint": "n/a", "preExistingFailures": 0 },
+      "items": [
+        {
+          "name": "--report silently excludes heartbeats from delivered/click-through/burst counts",
+          "source": "review:2026-07-25",
+          "priority": "P4",
+          "status": "completed",
+          "confidence": "high",
+          "specReviewed": false,
+          "commits": ["61039ac"],
+          "testsAdded": { "unit": 2, "e2e": 0 },
+          "browserVerified": { "ran": false, "result": "skip" },
+          "attempts": 1,
+          "retro": {
+            "wentWell": "Clean S-effort item -- TDD pinned the exact wording/semantics change with no surprises.",
+            "wentWrong": null,
+            "adjustment": null
+          }
+        }
+      ]
+    }
+  ]
+}

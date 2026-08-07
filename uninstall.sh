@@ -16,7 +16,14 @@ else
   echo "[--] notify.sh not found, skipping"
 fi
 
-# ── 2. Remove hooks from settings.json ───────────────────────────
+# ── 2. Remove the collected notification event log ───────────────
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-iterm-notify"
+if [ -d "$STATE_DIR" ]; then
+  rm -rf "$STATE_DIR"
+  echo "[ok] Removed event log at $STATE_DIR"
+fi
+
+# ── 3. Remove hooks from settings.json ───────────────────────────
 if [ -f "$SETTINGS" ]; then
   /usr/bin/python3 - "$SETTINGS" << 'PYREMOVE'
 import json, sys, os

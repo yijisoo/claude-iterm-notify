@@ -48,7 +48,7 @@ prepare_home() {
 test_case "install adds the three notify hooks to an empty settings.json"
 setup; prepare_home
 run_install
-assert_eq 3 "$(count_hook 'notify.sh')" "Stop + permission + question hooks present"
+assert_eq 4 "$(count_hook 'notify.sh')" "Stop + permission + question + SessionStart hooks present"
 teardown
 
 # ── install is idempotent ──────────────────────────────────────────
@@ -56,7 +56,7 @@ test_case "running install twice does not duplicate hooks"
 setup; prepare_home
 run_install
 run_install
-assert_eq 3 "$(count_hook 'notify.sh')" "still exactly three notify hooks"
+assert_eq 4 "$(count_hook 'notify.sh')" "still exactly four notify hooks"
 teardown
 
 # ── install preserves unrelated hooks ──────────────────────────────
@@ -67,7 +67,7 @@ cat > "$SETTINGS" <<'JSON'
 JSON
 run_install
 assert_eq 1 "$(count_hook 'other.sh')" "unrelated hook untouched"
-assert_eq 3 "$(count_hook 'notify.sh')" "notify hooks added alongside"
+assert_eq 4 "$(count_hook 'notify.sh')" "notify hooks added alongside"
 teardown
 
 # ── uninstall removes only this tool's hooks ───────────────────────
@@ -88,6 +88,20 @@ PY
 run_uninstall
 assert_eq 0 "$(count_hook '.claude/hooks/notify.sh')" "this tool's hooks removed"
 assert_eq 1 "$(count_hook 'other/notify.sh')" "unrelated notify.sh kept (tightened match)"
+teardown
+
+# ── uninstall removes the collected event log ──────────────────────
+test_case "uninstall removes the event-log state dir"
+setup; prepare_home
+run_install
+mkdir -p "$SANDBOX/home/.local/state/claude-iterm-notify"
+touch "$SANDBOX/home/.local/state/claude-iterm-notify/events.tsv"
+run_uninstall
+if [ ! -d "$SANDBOX/home/.local/state/claude-iterm-notify" ]; then
+  pass "event-log state dir removed"
+else
+  fail "event-log state dir left behind"
+fi
 teardown
 
 # ── uninstall is safe with no tty on stdin ─────────────────────────
