@@ -1,21 +1,92 @@
 #!/bin/bash
-# macOS notifications for Claude Code / OMC with iTerm2 click-to-focus.
+# claude-iterm-notify — macOS notifications for Claude Code / OMC
+# (oh-my-claudecode), with click-to-focus into the exact iTerm2 tab.
 #
-# Notify only when the firing session is shown in a live iTerm2 tab, and target
-# that tab directly. Two cases produce a notification:
+# ═══ The overall goal ═══════════════════════════════════════════════
+# When a Claude Code session needs the user (it finished a turn, wants a
+# permission, or asked a question), pop a native macOS notification — but
+# ONLY when that session is actually visible somewhere the user can act on
+# it, and make clicking the notification jump straight to that tab.
+#
+# "Somewhere the user can act" means a live iTerm2 tab. Two cases qualify:
 #   1. Claude running directly in an iTerm2 tab        -> target that tab
 #   2. Claude in a tmux session attached to a tab      -> target the client tab
 # A tmux session with NO attached client (an OMC worker/subagent or a stale,
-# detached run) has no tab to land on, so it is intentionally NOT notified.
+# detached run) has no tab to land on, so its "done" is intentionally NOT
+# notified — that would be noise the user cannot click into.
 #
-# Usage (Claude Code hooks):
-#   echo '{"cwd":"/path"}' | notify.sh stop
-#   echo '{"message":"..."}' | notify.sh permission
-#   echo '{"message":"..."}' | notify.sh question
+# Everything else in this file exists to keep those notifications quiet and
+# truthful: suppress the redundant ones (already watching, repeat pings,
+# mid-work pauses), retract the stale ones, and log every decision so the
+# noise level can be reviewed later.
 #
-# Click callback (terminal-notifier):
+# ═══ Entry points ═══════════════════════════════════════════════════
+# Claude Code hooks (one JSON — JavaScript Object Notation — payload on stdin):
+#   echo '{"cwd":"/path"}'      | notify.sh stop        # turn ended / ready
+#   echo '{"message":"..."}'    | notify.sh permission  # tool call awaits approval
+#   echo '{"message":"..."}'    | notify.sh question    # a question awaits an answer
+#   echo '{"cwd":"/path"}'      | notify.sh title       # SessionStart: name the tab (opt-in)
+# Invoked by terminal-notifier when the user clicks a notification:
 #   notify.sh --focus 'tty:/dev/ttysNNN'
+# Run by hand from a terminal:
+#   notify.sh --report [days]                           # summarize the event log
+#
+# ═══ How a hook event flows through the script ══════════════════════
+#   1. Parse the JSON payload -> PROJECT (working-directory basename).
+#   2. resolve_tab: which iTerm2 tab shows this session, if any — walk the
+#      process tree to the controlling tty (terminal device), then map a
+#      tmux pane to its attached client tab where applicable.
+#   3. clear_stale_notification: any new activity on a session retracts the
+#      banner it last posted, before anything else is decided.
+#   4. Suppression gates, in order — first match wins, every outcome logged:
+#        a. tab-less skip      stop only: nowhere to click into
+#        b. agent-worker skip  stop only: a worker's "done" belongs to its
+#                              orchestrator, not the user
+#        c. idle-gate hold     tab title still shows the working spinner ->
+#                              park the event; a background watcher delivers
+#                              when the session truly idles, with a "still
+#                              working" heartbeat if busy a full interval
+#        d. watching skip      iTerm2 frontmost on this very tab already
+#        e. debounce           stop only: at most one ping per window per
+#                              session, keyed on a durable identity
+#   5. Send via terminal-notifier, tagged with a per-session -group id so a
+#      later invocation can replace/retract it, plus a "live" marker on disk.
+#
+# ═══ State on disk ══════════════════════════════════════════════════
+#   ~/.local/state/claude-iterm-notify/events.tsv
+#       append-only TSV (tab-separated values) decision log; see --report
+#   /tmp/claude-iterm-notify-debounce/
+#       <hash>        debounce stamp (mtime = when this session last notified)
+#       hold-<hash>   idle-gate hold token (the newest stop owns delivery)
+#       since-<hash>  when the current busy stretch began (heartbeat clock)
+#       live-<hash>   marker: a banner for this session is currently showing
+#
+# ═══ Design rules the whole file follows ════════════════════════════
+#   * Gates match POSITIVELY, and detection failure means "gate does not
+#     engage", never "go silent": if Claude Code renames a flag or changes
+#     the spinner glyph, behavior degrades to notify-immediately. A late or
+#     duplicate notification is acceptable; a silently dropped one is not.
+#   * The hook must never fail, block, or leak output: external calls are
+#     `|| true`-guarded, osascript is bounded by a timeout, and stdout is
+#     swallowed (Claude Code surfaces stray hook stdout to the user).
+#   * Targeting is resolved at NOTIFICATION time, not click time: the click
+#     callback carries only a tty path. docs/notification-targeting.md
+#     records why the durable tmux: scheme was removed.
+#
+# Tuning knobs (environment variables), all optional:
+#   NOTIFY_DEBUG=1               trace decisions to /tmp/claude-iterm-notification-*.log
+#   NOTIFY_EVENT_LOG=0|<path>    disable or relocate the event log
+#   NOTIFY_ALWAYS=1              notify even when already watching the tab
+#   NOTIFY_AGENT_STOPS=1         notify agent-worker stops too
+#   NOTIFY_DEBOUNCE_SECONDS=N    stop-ping window per session (default 1200)
+#   NOTIFY_HOLD_MAX_SECONDS=N    busy-heartbeat interval (default 600; 0 disables idle-gating)
+#   NOTIFY_HOLD_POLL_SECONDS=N   idle-gate title poll interval (default 10)
+#   NOTIFY_SET_TITLE=1           allow the `title` hook to rename the tab
+#   NOTIFY_TEST=1                test harness: skip the Homebrew PATH prepend
 
+# Strict mode: unset variables and unchecked failures abort. Every call
+# below that may legitimately fail is explicitly `|| true`-guarded so the
+# only aborts left are genuine bugs.
 set -euo pipefail
 
 # terminal-notifier's click callback runs with a minimal PATH that excludes
@@ -112,6 +183,10 @@ as_escape() {
 }
 
 # ── AppleScript: select the iTerm2 tab whose session has the given tty ──
+# Brute-force walk over every window -> tab -> session, comparing each
+# session's tty to the target; on a match, raise that window and select the
+# tab. Each level sits in its own `try` so a window or tab closing mid-walk
+# skips that one object instead of aborting the whole search.
 # Returns "yes" on success, "no" if no matching tty is currently visible.
 focus_iterm_tty() {
   local target_tty="$1"
@@ -143,6 +218,9 @@ EOF
 }
 
 # ── Click-to-focus callback ────────────────────────────────────────
+# Not a hook: terminal-notifier runs this (via its -execute option) when the
+# user clicks a notification. The argument is the tty captured at send time;
+# find the tab showing it NOW and jump there, logging whether that worked.
 if [ "${1:-}" = "--focus" ]; then
   TARGET="${2:-}"
   case "$TARGET" in
@@ -158,6 +236,9 @@ if [ "${1:-}" = "--focus" ]; then
 fi
 
 # ── Summarize the event log ────────────────────────────────────────
+# Aggregates the TSV decision log (current file + rotated .old) into
+# delivery, suppression, click-through, and burst statistics — the tool for
+# judging whether the gates above are tuned right.
 # Must stay above the `PAYLOAD=$(cat)` hook flow: --report runs from a
 # terminal with no piped stdin and must not block waiting for it.
 if [ "${1:-}" = "--report" ]; then
@@ -258,6 +339,9 @@ DEBOUNCE_SECONDS="${NOTIFY_DEBOUNCE_SECONDS:-1200}"
 DEBOUNCE_DIR="${NOTIFY_DEBOUNCE_DIR:-/tmp/claude-iterm-notify-debounce}"
 
 # Filesystem-safe stamp name for a session key (shared by debounce + hold).
+# shasum keeps arbitrary keys (tmux session names may contain spaces or
+# unicode) collision-safe; if it is somehow unavailable, degrade to
+# character-squashing rather than failing the hook.
 hash_key() {
   local key
   key=$(printf '%s' "$1" | shasum 2>/dev/null | cut -c1-40)
@@ -267,6 +351,8 @@ hash_key() {
   printf '%s' "$key"
 }
 
+# One mtime-stamped file per session key: notify only if the stamp is
+# absent or older than the window, and (re)touch it whenever we do.
 debounce_ok() {
   local key_in="$1" key stamp now mtime
   key=$(hash_key "$key_in")
@@ -306,6 +392,11 @@ clear_stale_notification() {
 }
 
 # ── Find the controlling tty by walking up the process tree ───────
+# The hook process itself may report no terminal of its own (ps shows "??"),
+# but some ancestor — the Claude Code process, its shell, the tmux pane —
+# holds the controlling terminal this session lives on. Walk parent by
+# parent until one reports a real tty; that device path is the session's
+# identity for everything downstream (tab lookup, focus target, debounce key).
 get_tty() {
   local pid=$$ t
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
@@ -354,6 +445,8 @@ sys.exit(0 if any(0x2800 <= ord(c) <= 0x28FF for c in text) else 1)
 
 # ── Re-read the live title for the firing session's raw tty ────────
 # tmux pane title when the tty is a pane, else the iTerm2 session name.
+# Used by the idle-gate watcher to see the CURRENT spinner state, as opposed
+# to the snapshot resolve_tab took when the stop event originally fired.
 current_title() {
   local raw_tty="$1" t
   if command -v tmux >/dev/null 2>&1; then
@@ -452,10 +545,17 @@ EOF
 }
 
 # ── Notification flow ──────────────────────────────────────────────
+# Everything below runs once per hook event, top to bottom: read the
+# payload, build the banner text, resolve the tab, then fall through the
+# suppression gates to (maybe) a terminal-notifier send.
 HOOK_TYPE="${1:-stop}"
-PAYLOAD=$(cat)
+PAYLOAD=$(cat)   # Claude Code pipes one JSON object describing the event
 log "invoked: hook=$HOOK_TYPE pid=$$ ITERM_SESSION_ID=${ITERM_SESSION_ID:-<unset>}"
 
+# The project name (working-directory basename) is the notification's title
+# line and the per-project axis of the event log. python3 is the JSON
+# parser: always present on macOS, and never confused by quoting the way
+# grep/sed on JSON would be.
 CWD=$(/usr/bin/python3 -c "
 import sys, json
 print(json.load(sys.stdin).get('cwd', ''))
@@ -505,6 +605,9 @@ EOF
   exit 0
 fi
 
+# Map the hook type to banner text. Permission/Question quote the actual
+# prompt out of the payload (capped at 200 chars — Notification Center
+# truncates anyway); stop is always the fixed "Ready for input".
 case "$HOOK_TYPE" in
   stop)
     TITLE="$PROJECT"
@@ -532,6 +635,9 @@ print(str(m)[:200])
     ;;
 esac
 
+# resolve_tab reports over four lines (click target, human-readable
+# subtitle, durable session key, raw tty) — read them into the globals that
+# every gate and deliver_now consume from here on.
 { IFS= read -r TARGET; IFS= read -r SUBTITLE; IFS= read -r DEBOUNCE_KEY; IFS= read -r RAW_TTY; } < <(resolve_tab)
 log "TARGET=$TARGET SUBTITLE=$SUBTITLE DEBOUNCE_KEY=$DEBOUNCE_KEY RAW_TTY=$RAW_TTY"
 
@@ -677,5 +783,8 @@ if [ "$HOOK_TYPE" = "stop" ] && [ "$HOLD_MAX" -gt 0 ]; then
   rm -f "$HOLD_STAMP" "$HOLD_SINCE" 2>/dev/null || true
 fi
 
+# Immediate path: stop events whose title was already idle (or idle-gating
+# disabled), plus every permission/question. deliver_now still applies the
+# watching and debounce gates before actually sending.
 deliver_now
 log "done"
