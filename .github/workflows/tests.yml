@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    # macOS runner: the suite exercises osascript and the iTerm2 integration
+    # surface, so Linux is not a faithful environment for this tool.
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run test suite
+        run: ./tests/run.sh
